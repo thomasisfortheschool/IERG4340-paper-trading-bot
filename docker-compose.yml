@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # Backend API
+  api:
+    build: .
+    container_name: ierg4340-api
+    ports:
+      - "5000:5000"
+    environment:
+      FLASK_ENV: development
+      IB_HOST: 127.0.0.1
+      IB_PORT: 7497
+      IB_CLIENT_ID: 100
+    volumes:
+      - ./backend:/app
+    command: python api/app.py
+    networks:
+      - trading
+
+  # Frontend (optional - can run separately)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile.frontend
+  #   container_name: ierg4340-dashboard
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     NEXT_PUBLIC_API_URL: http://api:5000/api
+  #   depends_on:
+  #     - api
+  #   networks:
+  #     - trading
+
+networks:
+  trading:
+    driver: bridge
