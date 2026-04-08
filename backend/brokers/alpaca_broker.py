@@ -5,6 +5,7 @@ Uses Alpaca REST APIs for account, positions, quotes, and orders.
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 import logging
+import re
 import requests
 
 from .base_broker import BaseBroker, Position, Order, AccountSnapshot, BrokerFactory
@@ -326,6 +327,80 @@ class AlpacaBroker(BaseBroker):
     async def get_fundamental_data(self, symbol: str) -> Dict[str, Any]:
         # Fundamentals are sourced from yfinance in this project.
         return {}
+
+    async def get_trade_logs(self, days: int = 30, asset_type: str = "all", status: str = "all") -> List[Dict[str, Any]]:
+        """Return normalized recent trade logs from Alpaca fill activities."""
+        try:
+            resp = requests.get(
+                f"{self.base_url}/v2/account/activities",
+                headers=self._headers(),
+                params={
+                    "activity_types": "FILL",
+                    "direction": "desc",
+                    "page_size": 200,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            activities = resp.json() or []
+
+            cutoff = datetime.utcnow().timestamp() - max(1, int(days)) * 86400
+            rows: List[Dict[str, Any]] = []
+
+            for a in activities:
+                ts_text = a.get("transaction_time") or a.get("date")
+                if not ts_text:
+                    continue
+
+                try:
+                    ts = datetime.fromisoformat(str(ts_text).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+
+                if ts.timestamp() < cutoff:
+                    continue
+
+                symbol = str(a.get("symbol") or "")
+                if re.match(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$", symbol):
+                    normalized_type = "option"
+                    underlying = symbol[:6].rstrip()
+                else:
+                    normalized_type = "stock"
+                    underlying = symbol
+
+                side = str(a.get("side") or "buy").lower()
+                qty = abs(float(a.get("qty") or 0.0))
+                price = float(a.get("price") or 0.0)
+
+                row = {
+                    "trade_id": str(a.get("id") or a.get("order_id") or ""),
+                    "timestamp": ts.isoformat(),
+                    "strategy": "broker_fill",
+                    "asset_type": normalized_type,
+                    "symbol": symbol,
+                    "underlying": underlying,
+                    "side": side,
+                    "quantity": qty,
+                    "entry_price": price,
+                    "exit_price": None,
+                    "fees": 0.0,
+                    "gross_pnl": 0.0,
+                    "net_pnl": 0.0,
+                    "status": "closed",
+                    "notes": "Alpaca fill",
+                }
+                rows.append(row)
+
+            if asset_type != "all":
+                rows = [r for r in rows if str(r.get("asset_type", "")).lower() == asset_type]
+            if status != "all":
+                rows = [r for r in rows if str(r.get("status", "")).lower() == status]
+
+            rows.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+            return rows
+        except Exception as e:
+            logger.error("Failed to get Alpaca trade logs: %s", e)
+            return []
 
 
 BrokerFactory.register_broker("alpaca", AlpacaBroker)

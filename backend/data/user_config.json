@@ -1,0 +1,39 @@
+{
+  "mode": "forex_focused",
+  "allocation": {
+    "blowup_stocks_pct": 20.0,
+    "covered_calls_pct": 20.0,
+    "forex_pct": 60.0
+  },
+  "fundamental_screener": {
+    "relative_volume_threshold": 2.0,
+    "pe_ratio_max": 30.0,
+    "forward_pe_ratio_max": 25.0,
+    "price_min": 5.0,
+    "price_max": 500.0,
+    "market_cap_min_millions": 100.0
+  },
+  "option_screener": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "UVXY"
+    ],
+    "target_delta": 0.25,
+    "min_premium_pct": 0.5,
+    "dte_target": 0
+  },
+  "forex": {
+    "pairs": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY"
+    ],
+    "leverage": 1.0,
+    "max_position_size_pct": 5.0,
+    "grid_step_pct": 0.0015,
+    "grid_max_legs_per_pair": 3,
+    "grid_take_profit_steps": 1
+  }
+}

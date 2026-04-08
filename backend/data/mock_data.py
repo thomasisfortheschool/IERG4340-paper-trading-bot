@@ -3,7 +3,7 @@ Mock data generator for development and demo purposes.
 Generates realistic portfolio data without requiring actual broker connection.
 """
 from datetime import datetime, timedelta
-import random
+import math
 from typing import List, Dict, Any
 
 
@@ -16,22 +16,32 @@ class MockPortfolioGenerator:
         self.base_pnl = 0.0
     
     def generate_account_snapshot(self) -> Dict[str, Any]:
-        """Generate mock account snapshot."""
+        """Generate deterministic mock account snapshot aligned with history."""
         now = datetime.now()
-        
-        # Simulate some P&L
-        daily_change = random.uniform(-0.02, 0.03)  # -2% to +3% daily
-        daily_pnl = self.initial_capital * daily_change
-        total_pnl = random.uniform(-2500, 5000)  # Cumulative
+
+        # Keep snapshot consistent with the latest point in the chart history.
+        history = self.generate_daily_pnl_history(days=30)
+        latest = history[-1] if history else {
+            "daily_pnl": 0.0,
+            "daily_pnl_pct": 0.0,
+            "cumulative_pnl": 0.0,
+        }
+
+        daily_pnl = float(latest.get("daily_pnl", 0.0))
+        daily_pnl_pct = float(latest.get("daily_pnl_pct", 0.0))
+        total_pnl = float(latest.get("cumulative_pnl", 0.0))
+        total_value = self.initial_capital + total_pnl
+        cash = self.initial_capital * 0.4 + total_pnl * 0.1
+        buying_power = max(cash * 2.0, 0.0)
         
         return {
-            "total_value": round(self.initial_capital + total_pnl, 2),
-            "cash": round(self.initial_capital * 0.4 + random.uniform(-5000, 5000), 2),
-            "buying_power": round(self.initial_capital * 0.8, 2),
+            "total_value": round(total_value, 2),
+            "cash": round(cash, 2),
+            "buying_power": round(buying_power, 2),
             "total_pnl": round(total_pnl, 2),
             "total_pnl_pct": round((total_pnl / self.initial_capital) * 100, 2),
             "daily_pnl": round(daily_pnl, 2),
-            "daily_pnl_pct": round(daily_change * 100, 2),
+            "daily_pnl_pct": round(daily_pnl_pct, 2),
             "timestamp": now.isoformat(),
         }
     
@@ -72,13 +82,18 @@ class MockPortfolioGenerator:
         return positions
     
     def generate_daily_pnl_history(self, days: int = 30) -> List[Dict[str, Any]]:
-        """Generate daily P&L history."""
+        """Generate deterministic daily P&L history."""
         history = []
-        cumulative_pnl = -500.0  # Start slightly negative
+        cumulative_pnl = -1800.0  # Start below zero for realistic drawdown/recovery path
         
         for i in range(days, 0, -1):
             date = (datetime.now() - timedelta(days=i)).date()
-            daily_change = random.uniform(-1500, 2000)
+            idx = days - i
+
+            # Deterministic wave-based path: stable across refreshes and app restarts.
+            base_wave = 980.0 * math.sin((idx + 1) * 0.72)
+            trend_wave = 410.0 * math.cos((idx + 2) * 0.31)
+            daily_change = base_wave + trend_wave
             cumulative_pnl += daily_change
             
             history.append({
@@ -226,3 +241,115 @@ class MockPortfolioGenerator:
             },
         ]
         return opportunities
+
+    def generate_trade_logs(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Generate mock executed trade logs across stocks, options, and forex."""
+        now = datetime.now()
+        logs = [
+            {
+                "trade_id": "TRD-10001",
+                "timestamp": (now - timedelta(days=1, hours=3)).isoformat(),
+                "strategy": "covered_calls",
+                "asset_type": "option",
+                "symbol": "SPY 20260401 C455",
+                "underlying": "SPY",
+                "side": "sell_to_open",
+                "quantity": 1,
+                "entry_price": 1.28,
+                "exit_price": 0.42,
+                "fees": 1.35,
+                "gross_pnl": 86.0,
+                "net_pnl": 84.65,
+                "status": "closed",
+                "notes": "0DTE covered call premium capture",
+            },
+            {
+                "trade_id": "TRD-10002",
+                "timestamp": (now - timedelta(days=2, hours=1)).isoformat(),
+                "strategy": "forex",
+                "asset_type": "forex",
+                "symbol": "EURUSD",
+                "underlying": "EURUSD",
+                "side": "buy",
+                "quantity": 30000,
+                "entry_price": 1.0918,
+                "exit_price": 1.0947,
+                "fees": 2.1,
+                "gross_pnl": 87.0,
+                "net_pnl": 84.9,
+                "status": "closed",
+                "notes": "Momentum continuation",
+            },
+            {
+                "trade_id": "TRD-10003",
+                "timestamp": (now - timedelta(days=3, hours=4)).isoformat(),
+                "strategy": "blowup_stocks",
+                "asset_type": "stock",
+                "symbol": "NVDA",
+                "underlying": "NVDA",
+                "side": "buy",
+                "quantity": 20,
+                "entry_price": 861.2,
+                "exit_price": 874.8,
+                "fees": 1.8,
+                "gross_pnl": 272.0,
+                "net_pnl": 270.2,
+                "status": "closed",
+                "notes": "Breakout follow-through",
+            },
+            {
+                "trade_id": "TRD-10004",
+                "timestamp": (now - timedelta(days=4, hours=2)).isoformat(),
+                "strategy": "covered_calls",
+                "asset_type": "option",
+                "symbol": "QQQ 20260401 C388",
+                "underlying": "QQQ",
+                "side": "sell_to_open",
+                "quantity": 2,
+                "entry_price": 0.94,
+                "exit_price": 1.22,
+                "fees": 2.7,
+                "gross_pnl": -56.0,
+                "net_pnl": -58.7,
+                "status": "closed",
+                "notes": "Strike breached near close",
+            },
+            {
+                "trade_id": "TRD-10005",
+                "timestamp": (now - timedelta(days=5, hours=5)).isoformat(),
+                "strategy": "forex",
+                "asset_type": "forex",
+                "symbol": "USDJPY",
+                "underlying": "USDJPY",
+                "side": "sell",
+                "quantity": 25000,
+                "entry_price": 149.9,
+                "exit_price": 149.34,
+                "fees": 1.9,
+                "gross_pnl": 93.6,
+                "net_pnl": 91.7,
+                "status": "closed",
+                "notes": "Mean-reversion scalp",
+            },
+            {
+                "trade_id": "TRD-10006",
+                "timestamp": (now - timedelta(hours=3)).isoformat(),
+                "strategy": "covered_calls",
+                "asset_type": "option",
+                "symbol": "IWM 20260401 C197",
+                "underlying": "IWM",
+                "side": "sell_to_open",
+                "quantity": 1,
+                "entry_price": 0.88,
+                "exit_price": None,
+                "fees": 0.9,
+                "gross_pnl": 0.0,
+                "net_pnl": -0.9,
+                "status": "open",
+                "notes": "Open premium position",
+            },
+        ]
+
+        # Keep records bounded to requested horizon.
+        cutoff = now - timedelta(days=days)
+        return [row for row in logs if datetime.fromisoformat(row["timestamp"]) >= cutoff]

@@ -2,24 +2,30 @@
 
 import { useEffect, useState } from 'react';
 import { useTradingStore } from '@/store';
-import { accountApi, configApi } from '@/lib/api';
+import { accountApi, configApi, statusApi } from '@/lib/api';
 import Dashboard from '@/components/Dashboard';
 import Navbar from '@/components/Navbar';
 
 export default function Home() {
   const [loading, setLoading] = useState(true);
-  const { setAccount, setCurrentMode } = useTradingStore();
+  const { setAccount, setCurrentMode, setSelectedBroker } = useTradingStore();
 
   useEffect(() => {
     const fetchInitialData = async () => {
       try {
+        setSelectedBroker('ibkr');
         const [accountRes, configRes] = await Promise.all([
           accountApi.getSnapshot(),
           configApi.getCurrent(),
         ]);
+
+        const brokerRes = await statusApi.getBrokerStatus();
+        const brokerName = String(brokerRes.data?.broker || 'demo').toLowerCase();
+        const normalized = brokerName.includes('ibkr') ? 'ibkr' : brokerName.includes('alpaca') ? 'alpaca' : 'demo';
         
         setAccount(accountRes.data);
         setCurrentMode(configRes.data.mode || 'balanced');
+        setSelectedBroker(normalized);
       } catch (error) {
         console.error('Failed to fetch initial data:', error);
       } finally {
@@ -28,7 +34,7 @@ export default function Home() {
     };
 
     fetchInitialData();
-  }, [setAccount, setCurrentMode]);
+  }, [setAccount, setCurrentMode, setSelectedBroker]);
 
   if (loading) {
     return (

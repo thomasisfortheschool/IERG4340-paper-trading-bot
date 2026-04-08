@@ -45,6 +45,7 @@ class AccountSnapshot:
     positions: List[Position]
     daily_pnl: float = 0.0
     daily_pnl_pct: float = 0.0
+    currency: str = "USD"
 
 
 class BaseBroker(ABC):

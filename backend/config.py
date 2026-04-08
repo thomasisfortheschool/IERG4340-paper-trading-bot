@@ -145,6 +145,9 @@ class ConfigManager:
                 "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
                 "leverage": 1.0,
                 "max_position_size_pct": 5.0,
+                "grid_step_pct": 0.0015,
+                "grid_max_legs_per_pair": 3,
+                "grid_take_profit_steps": 1,
             },
         }
     
@@ -157,3 +160,96 @@ class ConfigManager:
             covered_calls_pct=alloc_dict.get("covered_calls_pct", 33.33),
             forex_pct=alloc_dict.get("forex_pct", 33.34),
         )
+    
+    def get_strategy_defaults(self) -> Dict[str, Any]:
+        """Get default strategy configurations with risk controls."""
+        return {
+            "blowup_stocks": {
+                "enabled": True,
+                "allocation_pct": 33.33,
+                "entry_rules": {
+                    "min_score": 50,
+                    "min_relative_volume": 2.0,
+                    "max_pe_ratio": 30,
+                },
+                "exit_rules": {
+                    "profit_target_pct": 5.0,
+                    "stop_loss_pct": 2.0,
+                    "max_holding_days": 30,
+                },
+                "risk_controls": {
+                    "stop_loss_pct": 2.0,
+                    "take_profit_pct": 5.0,
+                    "max_holding_days": 30,
+                    "max_position_size_pct": 5.0,
+                    "max_loss_pct": 1.0,
+                    "trailing_stop_pct": None,
+                },
+            },
+            "covered_calls": {
+                "enabled": True,
+                "allocation_pct": 33.33,
+                "entry_rules": {
+                    "min_volume": 1000000,
+                    "target_delta": 0.25,
+                    "min_premium_pct": 0.5,
+                },
+                "exit_rules": {
+                    "profit_target_pct": 2.0,
+                    "max_holding_days": 7,
+                },
+                "risk_controls": {
+                    "stop_loss_pct": 3.0,
+                    "take_profit_pct": 2.0,
+                    "max_holding_days": 7,
+                    "max_position_size_pct": 3.0,
+                    "max_loss_pct": 0.5,
+                    "trailing_stop_pct": None,
+                },
+            },
+            "forex": {
+                "enabled": True,
+                "allocation_pct": 33.34,
+                "entry_rules": {
+                    "min_volatility": 50,
+                    "min_atr": 50,
+                    "grid_step_pct": 0.0015,
+                    "grid_max_legs_per_pair": 3,
+                    "grid_take_profit_steps": 1,
+                },
+                "exit_rules": {
+                    "profit_target_pips": 30,
+                    "stop_loss_pips": 15,
+                    "max_holding_hours": 24,
+                },
+                "risk_controls": {
+                    "stop_loss_pct": 1.5,
+                    "take_profit_pct": 3.0,
+                    "max_holding_days": 1,
+                    "max_position_size_pct": 2.0,
+                    "max_loss_pct": 0.5,
+                    "trailing_stop_pct": None,
+                },
+            },
+        }
+    
+    def load_strategy_config(self, strategy_name: str) -> Dict[str, Any]:
+        """Load strategy configuration."""
+        config = self.load_user_config()
+        strategies = config.get("strategies", {})
+        
+        if strategy_name in strategies:
+            return strategies[strategy_name]
+        
+        # Return defaults
+        defaults = self.get_strategy_defaults()
+        return defaults.get(strategy_name, {})
+    
+    def save_strategy_config(self, strategy_name: str, config: Dict[str, Any]) -> None:
+        """Save strategy configuration."""
+        user_config = self.load_user_config()
+        if "strategies" not in user_config:
+            user_config["strategies"] = {}
+        
+        user_config["strategies"][strategy_name] = config
+        self.save_user_config(user_config)
