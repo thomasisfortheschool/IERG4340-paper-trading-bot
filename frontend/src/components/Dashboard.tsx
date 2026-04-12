@@ -12,16 +12,25 @@ import RiskManagementPanel from './RiskManagementPanel';
 import TickerResearchPanel from './TickerResearchPanel';
 import TradingLogPanel from './TradingLogPanel';
 import BotLogPanel from './BotLogPanel';
-import { BarChart3, Bot, Briefcase, ClipboardList, Search, Settings2, Shield, SlidersHorizontal, Sparkles } from 'lucide-react';
+import ForexGridPanel from './ForexGridPanel';
+import CryptoDeskPanel from './CryptoDeskPanel';
+import WatchlistSandboxPanel from './WatchlistSandboxPanel';
+import MarketOverviewPanel from './MarketOverviewPanel';
+import StrategyPerformancePanel from './StrategyPerformancePanel';
+import StrategyConfigurationPanel from './StrategyConfigurationPanel';
+import OvernightSummaryPanel from './OvernightSummaryPanel';
+import BacktestPanel from './BacktestPanel';
+import { BarChart3, Bot, Bookmark, Briefcase, CandlestickChart, ClipboardList, Coins, Search, Settings2, Shield, SlidersHorizontal, Sparkles, TrendingUp, Moon, Zap } from 'lucide-react';
 
 export default function Dashboard() {
-  const [activeTab, setActiveTab] = useState('home');
   const [tradeDeskView, setTradeDeskView] = useState<'signals' | 'strategy' | 'risk'>('signals');
   const [operationsView, setOperationsView] = useState<'orders' | 'bot'>('orders');
+  const [strategiesView, setStrategiesView] = useState<'performance' | 'configuration'>('performance');
+  const [toolsView, setToolsView] = useState<'backtest' | 'summary'>('summary');
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState('');
-  const { setAccount, setPositions, refreshToken, selectedBroker } = useTradingStore();
+  const { setAccount, setPositions, refreshToken, selectedBroker, activeTab, setActiveTab } = useTradingStore();
 
   useEffect(() => {
     const fetchData = async () => {
@@ -52,8 +61,7 @@ export default function Dashboard() {
         } else {
           setFetchError('Dashboard API unreachable. Check backend server on port 5000.');
         }
-      } catch (error) {
-        console.error('Failed to fetch dashboard data:', error);
+      } catch {
         setFetchError('Dashboard API unreachable. Check backend server on port 5000.');
       } finally {
         setLoading(false);
@@ -84,6 +92,12 @@ export default function Dashboard() {
           { id: 'home', label: 'Home', icon: BarChart3 },
           { id: 'trade-desk', label: 'Trade Desk', icon: Sparkles },
           { id: 'positions', label: 'Portfolio', icon: Briefcase },
+          { id: 'watchlists', label: 'Watchlists', icon: Bookmark },
+          { id: 'sim-portfolios', label: 'Sim Portfolios', icon: Briefcase },
+          { id: 'strategies', label: 'Strategies', icon: TrendingUp },
+          { id: 'tools', label: 'Tools', icon: Zap },
+          { id: 'forex', label: 'Forex Desk', icon: CandlestickChart },
+          { id: 'crypto', label: 'Crypto Desk', icon: Coins },
           { id: 'research', label: 'Research', icon: Search },
           { id: 'operations', label: 'Operations', icon: ClipboardList },
           { id: 'settings', label: 'Bot Configuration', icon: Settings2 },
@@ -104,7 +118,12 @@ export default function Dashboard() {
 
       {/* Tab Content */}
       <div className="min-h-[60vh] pb-8">
-        {activeTab === 'home' && <PortfolioChart history={history} source={selectedBroker} />}
+        {activeTab === 'home' && (
+          <div className="space-y-6">
+            <MarketOverviewPanel />
+            <PortfolioChart history={history} source={selectedBroker} />
+          </div>
+        )}
 
         {activeTab === 'trade-desk' && (
           <div className="space-y-5">
@@ -136,6 +155,62 @@ export default function Dashboard() {
         )}
 
         {activeTab === 'positions' && <PositionsPanel />}
+        {activeTab === 'watchlists' && <WatchlistSandboxPanel view="watchlists" />}
+        {activeTab === 'sim-portfolios' && <WatchlistSandboxPanel view="portfolio" />}
+        {activeTab === 'strategies' && (
+          <div className="space-y-5">
+            <div className="rounded-2xl border border-slate-700/70 bg-slate-900/30 p-2">
+              <div className="scroll-row md:flex md:flex-wrap md:gap-2">
+                {[
+                  { id: 'performance', label: 'Performance', icon: TrendingUp },
+                  { id: 'configuration', label: 'Configuration', icon: Settings2 },
+                ].map((view) => (
+                  <button
+                    key={view.id}
+                    onClick={() => setStrategiesView(view.id as 'performance' | 'configuration')}
+                    className={`tab-pill ${strategiesView === view.id ? 'tab-pill-active' : ''}`}
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <view.icon size={14} />
+                      {view.label}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {strategiesView === 'performance' && <StrategyPerformancePanel />}
+            {strategiesView === 'configuration' && <StrategyConfigurationPanel />}
+          </div>
+        )}
+        {activeTab === 'tools' && (
+          <div className="space-y-5">
+            <div className="rounded-2xl border border-slate-700/70 bg-slate-900/30 p-2 overflow-x-auto">
+              <div className="flex gap-2">
+                {[
+                  { id: 'summary', label: 'Overnight Summary', icon: Moon },
+                  { id: 'backtest', label: 'Backtest', icon: Zap },
+                ].map((view) => (
+                  <button
+                    key={view.id}
+                    onClick={() => setToolsView(view.id as 'backtest' | 'summary')}
+                    className={`tab-pill whitespace-nowrap ${toolsView === view.id ? 'tab-pill-active' : ''}`}
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <view.icon size={14} />
+                      {view.label}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {toolsView === 'summary' && <OvernightSummaryPanel />}
+            {toolsView === 'backtest' && <BacktestPanel />}
+          </div>
+        )}
+        {activeTab === 'forex' && <ForexGridPanel />}
+        {activeTab === 'crypto' && <CryptoDeskPanel />}
         {activeTab === 'research' && <TickerResearchPanel />}
 
         {activeTab === 'operations' && (

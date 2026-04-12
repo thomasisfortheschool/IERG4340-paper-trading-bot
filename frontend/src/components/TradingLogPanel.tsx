@@ -2,8 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { tradingApi } from '@/lib/api';
-import { useTradingStore } from '@/store';
-import { Beaker, Building2, ClipboardList, Download, Filter, ShieldCheck } from 'lucide-react';
+import { Building2, ClipboardList, Download, Filter } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
 type TradeLog = {
@@ -34,21 +33,13 @@ const money = (value: number) =>
   }).format(value);
 
 export default function TradingLogPanel() {
-  const { selectedBroker } = useTradingStore();
   const [logs, setLogs] = useState<TradeLog[]>([]);
   const [loading, setLoading] = useState(true);
-  const [simulating, setSimulating] = useState(false);
-  const [simulateMessage, setSimulateMessage] = useState('');
-  const [tryMode, setTryMode] = useState<'simulated' | 'live_paper'>('simulated');
-  const [source, setSource] = useState('demo');
+  const [source, setSource] = useState('bot_ledger');
   const [assetType, setAssetType] = useState('all');
   const [status, setStatus] = useState('all');
   const [executionFilter, setExecutionFilter] = useState('all');
   const [search, setSearch] = useState('');
-  const tryRounds = 8;
-  const tryQuantity = tryMode === 'live_paper' ? 1000 : 2000;
-  const perRoundWorstCase = tryMode === 'live_paper' ? 3.5 : 2.0;
-  const maxExpectedLoss = Math.round(tryRounds * perRoundWorstCase * 100) / 100;
   const inferMarket = (symbol: string) => {
     const s = String(symbol || '').toUpperCase();
     if (s.endsWith('.HK')) return 'HK';
@@ -63,7 +54,7 @@ export default function TradingLogPanel() {
     try {
       const res = await tradingApi.getLogs({ assetType, status, days: 60 });
       setLogs(res.data.logs || []);
-      setSource(String(res.data?.meta?.source || 'demo').toLowerCase());
+      setSource(String(res.data?.meta?.source || 'bot_ledger').toLowerCase());
     } catch (error) {
       console.error('Failed to load trading logs:', error);
       setLogs([]);
@@ -77,58 +68,18 @@ export default function TradingLogPanel() {
     fetchLogs();
   }, [assetType, status]);
 
-  const handleTryBuySell = async () => {
-    if (tryMode === 'live_paper' && selectedBroker !== 'ibkr') {
-      setSimulateMessage('Live paper mode requires IBKR paper source. Switch broker to IBKR first.');
-      return;
-    }
-
-    let approved = true;
-    if (tryMode === 'live_paper') {
-      approved = window.confirm(
-        'Run Tiny Live Paper mode? This will place tiny real paper forex BUY/SELL round-trip orders via IBKR.'
-      );
-      if (!approved) {
-        return;
-      }
-    }
-
-    setSimulating(true);
-    setSimulateMessage(
-      tryMode === 'live_paper'
-        ? 'Running tiny live paper forex buy/sell burst...'
-        : 'Running quick forex buy/sell simulation...'
-    );
-    try {
-      const res = await tradingApi.tryBuySell(tryRounds, tryQuantity, tryMode, approved);
-      const created = Number(res.data?.created || 0);
-      const attempts = Number(res.data?.attempts || created);
-      const submitted = Number(res.data?.submitted || created);
-      const failed = Number(res.data?.failed || 0);
-      const net = Number(res.data?.total_net_pnl || 0);
-      const modeLabel = tryMode === 'live_paper' ? 'tiny live paper' : 'simulated';
-      setSimulateMessage(
-        `Created ${created} ${modeLabel} forex records. Attempts: ${attempts}, submitted: ${submitted}, failed: ${failed}. Combined net P&L: ${net >= 0 ? '+' : ''}${money(net)}.`
-      );
-      await fetchLogs();
-    } catch (error: any) {
-      const msg = error?.response?.data?.error || 'Failed to create simulated trades';
-      setSimulateMessage(msg);
-    } finally {
-      setSimulating(false);
-    }
-  };
-
   const filteredLogs = useMemo(() => {
     const getExecutionType = (row: TradeLog) => {
-      if (row.execution_origin === 'simulated' || row.is_simulated === true || row.strategy === 'try_buy_sell') return 'simulated';
-      if (row.execution_origin === 'live_paper' || row.strategy === 'try_buy_sell_live') return 'live_paper';
+      if (row.strategy === 'try_buy_sell' || row.strategy === 'try_buy_sell_live') return 'testing';
+      if (row.execution_origin === 'simulated' || row.is_simulated === true) return 'simulated';
+      if (row.execution_origin === 'live_paper') return 'live_paper';
       return 'broker';
     };
 
     const q = search.trim().toLowerCase();
     return logs.filter((row) => {
       const executionType = getExecutionType(row);
+      if (executionType === 'testing') return false;
       const matchesExecution = executionFilter === 'all' || executionType === executionFilter;
       const matchesSearch = !q || (
         row.trade_id.toLowerCase().includes(q) ||
@@ -261,8 +212,7 @@ export default function TradingLogPanel() {
               className="input-modern"
             >
               <option value="all">All Execution</option>
-              <option value="simulated">Simulated</option>
-              <option value="live_paper">Tiny Live Paper</option>
+              <option value="live_paper">Live Paper</option>
               <option value="broker">Live Fill</option>
             </select>
 
@@ -283,34 +233,9 @@ export default function TradingLogPanel() {
             {loading ? 'Loading records...' : `${filteredLogs.length} records`}
           </div>
           <div className="text-xs text-slate-300">
-            Source: <span className="text-slate-100 uppercase">{source}</span>
+            Source: <span className="text-slate-100 uppercase">{source === 'bot_ledger' ? 'BOT LEDGER' : source}</span>
           </div>
           <div className="inline-flex items-center gap-2">
-            <select
-              value={tryMode}
-              onChange={(e) => setTryMode(e.target.value as 'simulated' | 'live_paper')}
-              disabled={simulating || loading}
-              className="input-modern w-[180px] h-10"
-            >
-              <option value="simulated">Try Mode: Simulated</option>
-              <option value="live_paper">Try Mode: Tiny Live Paper</option>
-            </select>
-            <div className="hidden lg:block rounded-lg border border-slate-600/70 bg-slate-900/35 px-3 py-2">
-              <p className="text-[10px] uppercase tracking-wide text-slate-400">Risk Envelope</p>
-              <p className="text-xs font-semibold text-amber-200">
-                Max expected loss: {money(maxExpectedLoss)}
-              </p>
-              <p className="text-[11px] text-slate-400">
-                Formula: {tryRounds} rounds x {money(perRoundWorstCase)} worst-case/round
-              </p>
-            </div>
-            <button
-              onClick={handleTryBuySell}
-              disabled={loading || simulating}
-              className="btn-secondary inline-flex items-center gap-2 disabled:opacity-50"
-            >
-              {simulating ? 'Trying...' : tryMode === 'live_paper' ? 'Try Buy/Sell (Live)' : 'Try Buy/Sell'}
-            </button>
             <button
               onClick={exportCsv}
               disabled={loading || filteredLogs.length === 0}
@@ -328,17 +253,6 @@ export default function TradingLogPanel() {
               Excel
             </button>
           </div>
-        </div>
-
-        {simulateMessage && (
-          <div className="px-4 py-2 border-b border-slate-700/60 bg-slate-900/25 text-xs text-slate-200">
-            {simulateMessage}
-          </div>
-        )}
-
-        <div className="lg:hidden px-4 py-2 border-b border-slate-700/60 bg-slate-900/20 text-xs text-amber-200">
-          Risk Envelope: Max expected loss {money(maxExpectedLoss)} for {tryMode === 'live_paper' ? 'tiny live paper' : 'simulated'} mode.
-          <span className="block text-slate-300 mt-1">Formula: {tryRounds} rounds x {money(perRoundWorstCase)} worst-case/round.</span>
         </div>
 
         <div className="overflow-x-auto">
@@ -372,26 +286,21 @@ export default function TradingLogPanel() {
               )}
 
               {filteredLogs.map((row) => {
-                const executionType = row.execution_origin === 'simulated' || row.is_simulated === true || row.strategy === 'try_buy_sell'
-                  ? 'simulated'
-                  : row.execution_origin === 'live_paper' || row.strategy === 'try_buy_sell_live'
-                    ? 'live_paper'
-                    : 'broker';
-                const executionClass = executionType === 'simulated'
-                  ? 'bg-slate-800 border-slate-500/50 text-slate-200'
-                  : executionType === 'live_paper'
-                    ? 'bg-emerald-900/30 border-emerald-500/50 text-emerald-200'
+                const executionType = row.execution_origin === 'live_paper'
+                  ? 'live_paper'
+                  : row.execution_origin === 'broker'
+                    ? 'broker'
+                    : (row.is_simulated ? 'simulated' : 'broker');
+                const executionClass = executionType === 'live_paper'
+                  ? 'bg-emerald-900/30 border-emerald-500/50 text-emerald-200'
+                  : executionType === 'simulated'
+                    ? 'bg-slate-800 border-slate-500/50 text-slate-200'
                     : 'bg-cyan-900/30 border-cyan-500/50 text-cyan-200';
-                const executionLabel = executionType === 'simulated'
-                  ? 'SIMULATED'
-                  : executionType === 'live_paper'
-                    ? 'LIVE PAPER'
+                const executionLabel = executionType === 'live_paper'
+                  ? 'LIVE PAPER'
+                  : executionType === 'simulated'
+                    ? 'SIMULATED'
                     : 'LIVE FILL';
-                const executionIcon = executionType === 'simulated'
-                  ? <Beaker size={12} />
-                  : executionType === 'live_paper'
-                    ? <ShieldCheck size={12} />
-                    : <Building2 size={12} />;
 
                 return (
                 <tr key={row.trade_id} className="border-t border-slate-700/55 hover:bg-slate-900/25">
@@ -399,7 +308,7 @@ export default function TradingLogPanel() {
                   <td className="px-3 py-3 text-slate-200 font-medium">{row.trade_id}</td>
                   <td className="px-3 py-3">
                     <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs border font-semibold ${executionClass}`}>
-                      {executionIcon}
+                      <Building2 size={12} />
                       {executionLabel}
                     </span>
                   </td>

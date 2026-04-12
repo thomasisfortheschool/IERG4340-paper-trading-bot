@@ -32,6 +32,7 @@
     ],
     "leverage": 1.0,
     "max_position_size_pct": 5.0,
+    "tick_seconds": 1,
     "grid_step_pct": 0.0015,
     "grid_max_legs_per_pair": 3,
     "grid_take_profit_steps": 1

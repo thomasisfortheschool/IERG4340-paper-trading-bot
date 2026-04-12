@@ -1,0 +1,30 @@
+[
+  {
+    "id": "84c78bcd-76fc-4239-9d78-4927ca3958b9",
+    "name": "Sandbox Portfolio",
+    "cash": 993675.36,
+    "starting_cash": 1019723.36,
+    "holdings": [
+      {
+        "id": "0e9156ce-451c-445a-be46-e40a7583a578",
+        "symbol": "AAPL",
+        "shares": 100.0,
+        "buy_price": 260.48,
+        "buy_date": "2026-04-12",
+        "created_at": "2026-04-12T23:06:16.577105",
+        "price_source": "current_market"
+      }
+    ],
+    "created_at": "2026-04-12T23:05:54.963008",
+    "updated_at": "2026-04-12T23:06:16.577114"
+  },
+  {
+    "id": "7100dc41-3c9e-497a-9f65-d29a861b8945",
+    "name": "portfolio 2",
+    "cash": 1019723.36,
+    "starting_cash": 1019723.36,
+    "holdings": [],
+    "created_at": "2026-04-12T23:06:32.168754",
+    "updated_at": "2026-04-12T23:06:32.168760"
+  }
+]

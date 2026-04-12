@@ -48,6 +48,36 @@ export const tradingApi = {
   ) => api.post('/trade/try-buy-sell', { rounds, quantity, mode, confirm_live: confirmLive }),
 };
 
+export const tradeMetricsApi = {
+  getHistory: (limit: number = 100, strategy?: string, symbol?: string) => {
+    const params: Record<string, any> = { limit };
+    if (strategy) params.strategy = strategy;
+    if (symbol) params.symbol = symbol;
+    return api.get('/trades/history', { params });
+  },
+  logTrade: (trade: {
+    symbol: string;
+    entry_price: number;
+    exit_price: number;
+    quantity: number;
+    strategy?: string;
+    entry_reason?: string;
+    mode?: string;
+  }) => api.post('/trades/log', trade),
+  getMetrics: () => api.get('/trades/metrics'),
+  getMetricsByStrategy: () => api.get('/trades/metrics/by-strategy'),
+  getDailyPnL: () => api.get('/trades/daily-pnl'),
+};
+
+export const backtestApi = {
+  run: (symbol: string, strategy: string, daysLookback: number = 60, initialCapital: number = 10000) =>
+    api.post('/backtest', { symbol, strategy, days_lookback: daysLookback, initial_capital: initialCapital }),
+};
+
+export const summaryApi = {
+  getOvernightSummary: () => api.get('/summary/overnight'),
+};
+
 export const tickerApi = {
   research: (
     symbol: string,
@@ -62,6 +92,7 @@ export const tickerApi = {
 
 export const brokerApi = {
   getOptions: () => api.get('/broker/options'),
+  getCapabilities: () => api.get('/broker/capabilities'),
   switch: (broker: string, config: any = {}) => api.post('/broker/switch', { broker, config }),
 };
 
@@ -88,11 +119,6 @@ export const strategyApi = {
   getDefaults: () => api.get('/strategy/defaults'),
 };
 
-export const backtestApi = {
-  run: (symbol: string, strategy: string, lookbackDays: number = 252) =>
-    api.get(`/backtest/${symbol}/${strategy}?lookback_days=${lookbackDays}`),
-};
-
 export const signalApi = {
   createWithMetadata: (
     symbol: string,
@@ -108,10 +134,33 @@ export const signalApi = {
 
 export const marketApi = {
   getRegime: () => api.get('/market-regime'),
+  getIndices: () => api.get('/market/indices'),
   getPerformanceByRegime: (strategy: string = 'blowup_stocks') =>
     api.get(`/performance/by-regime?strategy=${strategy}`),
 };
 
 export const riskApi = {
   getPositionRisks: () => api.get('/positions/risks'),
+};
+
+export const watchlistApi = {
+  getAll: () => api.get('/watchlists'),
+  create: (payload: { name: string; category?: string; symbols?: string[] | string; notes?: string }) =>
+    api.post('/watchlists', payload),
+  update: (watchlistId: string, payload: { name?: string; category?: string; symbols?: string[] | string; notes?: string }) =>
+    api.put(`/watchlists/${watchlistId}`, payload),
+  remove: (watchlistId: string) => api.delete(`/watchlists/${watchlistId}`),
+};
+
+export const simPortfolioApi = {
+  getAll: () => api.get('/sim-portfolios'),
+  create: (payload: { name?: string; initial_cash?: number; clone_current_account?: boolean }) =>
+    api.post('/sim-portfolios', payload),
+  remove: (portfolioId: string) => api.delete(`/sim-portfolios/${portfolioId}`),
+  addHolding: (
+    portfolioId: string,
+    payload: { symbol: string; shares: number; buy_price?: number | string; buy_date?: string }
+  ) => api.post(`/sim-portfolios/${portfolioId}/holdings`, payload),
+  removeHolding: (portfolioId: string, holdingId: string) =>
+    api.delete(`/sim-portfolios/${portfolioId}/holdings/${holdingId}`),
 };

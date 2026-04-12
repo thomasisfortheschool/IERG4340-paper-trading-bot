@@ -183,6 +183,34 @@ class IBKRBroker(BaseBroker):
             logger.error("Failed to place forex order %s %s: %s", pair, side, e)
             return None
 
+    async def place_crypto_order(self, symbol: str, side: str, quantity: float) -> Optional[Order]:
+        """Place a crypto market order through IBKR's PAXOS venue when available."""
+        try:
+            normalized = str(symbol or "").upper().strip()
+            if not normalized or "-" not in normalized:
+                return None
+
+            base, quote = normalized.split("-", 1)
+            contract = Contract(secType="CRYPTO", symbol=base, currency=quote, exchange="PAXOS")
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
+
+            trade = self.ib.placeOrder(contract, MarketOrder(side.upper(), float(quantity)))
+            return Order(
+                order_id=str(trade.order.orderId),
+                symbol=normalized,
+                side=side.lower(),
+                order_type="market",
+                quantity=float(quantity),
+                price=None,
+                status="submitted",
+                timestamp=datetime.now(),
+            )
+        except Exception as e:
+            logger.error("Failed to place crypto order %s %s: %s", symbol, side, e)
+            return None
+
     async def sell_covered_call(
         self,
         symbol: str,

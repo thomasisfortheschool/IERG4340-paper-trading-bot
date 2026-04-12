@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useTradingStore } from '@/store';
 import { botApi, brokerApi, configApi, statusApi } from '@/lib/api';
-import { Activity, Bot, SlidersHorizontal, Sparkles, Wallet } from 'lucide-react';
+import { Activity, AlertTriangle, Bot, SlidersHorizontal, Sparkles, Wallet } from 'lucide-react';
 
 export default function SettingsPanel() {
   const { config, currentMode, setConfig, setCurrentMode } = useTradingStore();
@@ -15,6 +15,7 @@ export default function SettingsPanel() {
   });
   const [selectedBroker, setSelectedBroker] = useState('ibkr');
   const [brokerRuntimeConfig, setBrokerRuntimeConfig] = useState<any>({});
+  const [brokerCapabilities, setBrokerCapabilities] = useState<any>(null);
   const [brokerStatus, setBrokerStatus] = useState('');
   const [brokerLoading, setBrokerLoading] = useState(false);
   const [executionMode, setExecutionMode] = useState<'manual' | 'automatic'>('manual');
@@ -27,6 +28,10 @@ export default function SettingsPanel() {
   const [botLastRun, setBotLastRun] = useState<string | null>(null);
   const [botLastError, setBotLastError] = useState<string | null>(null);
   const [settingsConfig, setSettingsConfig] = useState<any>(null);
+  const [cryptoEnabled, setCryptoEnabled] = useState(false);
+  const [cryptoSymbolsInput, setCryptoSymbolsInput] = useState('BTC-USD, ETH-USD');
+  const [cryptoRiskAck, setCryptoRiskAck] = useState(false);
+  const [cryptoAdvancedAck, setCryptoAdvancedAck] = useState(false);
 
   const getHeartbeatAge = (iso: string | null) => {
     if (!iso) return 'N/A';
@@ -51,6 +56,7 @@ export default function SettingsPanel() {
         configApi.getCurrent(),
         configApi.getPresets(),
         brokerApi.getOptions(),
+        brokerApi.getCapabilities(),
         botApi.getStatus(),
         statusApi.getHealth(),
       ]);
@@ -80,6 +86,7 @@ export default function SettingsPanel() {
         const brokerData = brokerResult.value.data || {};
         setSelectedBroker(brokerData.current || 'demo');
         setBrokerRuntimeConfig(brokerData.active_config || {});
+        setBrokerCapabilities(brokerData.capabilities || null);
         setBrokerStatus(
           brokerData.connected ? `Connected to ${String(brokerData.current || 'demo').toUpperCase()}` : 'Demo mode active'
         );
@@ -103,6 +110,14 @@ export default function SettingsPanel() {
       mounted = false;
     };
   }, [setConfig, setCurrentMode]);
+
+  useEffect(() => {
+    const nextCrypto = (settingsConfig ?? config)?.crypto ?? {};
+    setCryptoEnabled(Boolean(nextCrypto.enabled));
+    setCryptoSymbolsInput(Array.isArray(nextCrypto.symbols) && nextCrypto.symbols.length > 0 ? nextCrypto.symbols.join(', ') : 'BTC-USD, ETH-USD');
+    setCryptoRiskAck(Boolean(nextCrypto.risk_acknowledged));
+    setCryptoAdvancedAck(Boolean(nextCrypto.advanced_user_confirmed));
+  }, [settingsConfig, config]);
 
   const saveConfig = async (nextConfig: any, message: string) => {
     const response = await configApi.update(nextConfig);
@@ -167,13 +182,56 @@ export default function SettingsPanel() {
     }
   };
 
+  const normalizeCryptoSymbols = (input: string) =>
+    input
+      .split(',')
+      .map((token) => token.trim().toUpperCase())
+      .filter((token) => token.length > 0)
+      .map((token) => (token.includes('-') ? token : `${token}-USD`));
+
+  const handleCryptoSettingsSave = async () => {
+    const normalizedSymbols = normalizeCryptoSymbols(cryptoSymbolsInput);
+    if (cryptoEnabled && normalizedSymbols.length === 0) {
+      setBotStatusMessage('Add at least one crypto symbol before enabling 24/7 crypto mode.');
+      return;
+    }
+    if (cryptoEnabled && (!cryptoRiskAck || !cryptoAdvancedAck)) {
+      setBotStatusMessage('Enable confirmations first: this mode is only for aggressive and advanced users.');
+      return;
+    }
+
+    const existingCrypto = currentSettings?.crypto || {};
+
+    try {
+      await saveConfig(
+        {
+          ...currentSettings,
+          crypto: {
+            ...existingCrypto,
+            enabled: cryptoEnabled,
+            symbols: normalizedSymbols,
+            risk_acknowledged: cryptoRiskAck,
+            advanced_user_confirmed: cryptoAdvancedAck,
+          },
+        },
+        cryptoEnabled
+          ? `24/7 crypto mode enabled for ${normalizedSymbols.join(', ')}`
+          : '24/7 crypto mode disabled.'
+      );
+    } catch (error: any) {
+      setBotStatusMessage(error?.response?.data?.error || error?.message || 'Failed to save crypto settings');
+    }
+  };
+
   const handleBrokerSwitch = async () => {
     setBrokerLoading(true);
     try {
       const response = await brokerApi.switch(selectedBroker, selectedBroker === 'ibkr' ? brokerRuntimeConfig : {});
+      const capabilityResponse = await brokerApi.getCapabilities();
       const nextBroker = response.data?.broker || selectedBroker;
       setSelectedBroker(nextBroker);
       setBrokerRuntimeConfig(response.data?.config || {});
+      setBrokerCapabilities(capabilityResponse.data || null);
       setBrokerStatus(
         nextBroker === 'demo'
           ? 'Switched to demo mode'
@@ -475,6 +533,18 @@ export default function SettingsPanel() {
                 {brokerStatus && <p className="text-sm text-slate-100">{brokerStatus}</p>}
                 <p className="text-xs text-slate-300 leading-snug">IBKR uses TWS/Gateway on your configured host/port.</p>
 
+                {brokerCapabilities && (
+                  <div className="rounded-xl border border-slate-600/70 bg-slate-900/35 p-2.5 text-xs text-slate-300 space-y-1">
+                    <p className="font-semibold text-slate-100">Broker Capabilities</p>
+                    <p>
+                      Equities: <span className={brokerCapabilities?.supports?.equities ? 'text-emerald-300' : 'text-rose-300'}>{brokerCapabilities?.supports?.equities ? 'Yes' : 'No'}</span>
+                      {' | '}Forex: <span className={brokerCapabilities?.supports?.forex ? 'text-emerald-300' : 'text-rose-300'}>{brokerCapabilities?.supports?.forex ? 'Yes' : 'No'}</span>
+                      {' | '}Crypto: <span className={brokerCapabilities?.supports?.crypto ? 'text-emerald-300' : 'text-rose-300'}>{brokerCapabilities?.supports?.crypto ? 'Yes' : 'No'}</span>
+                    </p>
+                    <p className="text-slate-400">{brokerCapabilities?.crypto?.reason || 'No crypto capability details available.'}</p>
+                  </div>
+                )}
+
                 {selectedBroker === 'ibkr' && (
                   <div className="rounded-xl border border-slate-600/70 bg-slate-900/35 p-2.5 text-xs text-slate-300">
                     <p className="font-semibold text-slate-100 mb-1">IB Runtime</p>
@@ -563,6 +633,66 @@ export default function SettingsPanel() {
 
               {botStatusMessage && <p className="text-sm text-slate-100 mt-2">{botStatusMessage}</p>}
               <p className="text-xs text-slate-300 mt-2">Manual mode only provides data/screening. Automatic mode enables bot cycles and live trading.</p>
+            </section>
+
+            <section className="card space-y-4 border border-red-500/40 bg-gradient-to-br from-red-950/40 via-slate-900/60 to-slate-950/70">
+              <div className="flex items-center gap-3 mb-1">
+                <AlertTriangle className="text-red-300" size={20} />
+                <h3 className="text-xl font-bold">24/7 Crypto (Advanced)</h3>
+              </div>
+
+              <div className="rounded-xl border border-red-400/40 bg-red-500/10 p-3 text-sm text-red-100 leading-relaxed">
+                <p className="font-semibold uppercase tracking-wide text-red-200 text-xs mb-1">High Volatility Warning</p>
+                <p>
+                  Real crypto trading is for aggressive and advanced users only. Crypto can move violently at any hour, including while you are asleep,
+                  and losses can compound quickly under automated execution.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs uppercase tracking-wide text-slate-300 mb-2">Crypto Symbols (comma separated)</label>
+                <input
+                  type="text"
+                  value={cryptoSymbolsInput}
+                  onChange={(e) => setCryptoSymbolsInput(e.target.value)}
+                  className="input-modern"
+                  placeholder="BTC-USD, ETH-USD"
+                />
+              </div>
+
+              <label className="flex items-start gap-3 rounded-xl border border-slate-600/70 bg-slate-900/35 p-3 text-sm text-slate-100">
+                <input
+                  type="checkbox"
+                  checked={cryptoRiskAck}
+                  onChange={(e) => setCryptoRiskAck(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 accent-red-400"
+                />
+                <span>I understand crypto is highly volatile and I can take rapid losses.</span>
+              </label>
+
+              <label className="flex items-start gap-3 rounded-xl border border-slate-600/70 bg-slate-900/35 p-3 text-sm text-slate-100">
+                <input
+                  type="checkbox"
+                  checked={cryptoAdvancedAck}
+                  onChange={(e) => setCryptoAdvancedAck(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 accent-red-400"
+                />
+                <span>I confirm I am an advanced user and I accept aggressive 24/7 automation risk.</span>
+              </label>
+
+              <div className="flex flex-col gap-2">
+                <button
+                  onClick={() => setCryptoEnabled((prev) => !prev)}
+                  className={`w-full rounded-xl px-4 py-2.5 text-sm font-semibold transition ${
+                    cryptoEnabled
+                      ? 'bg-red-500/80 text-white hover:bg-red-500'
+                      : 'bg-emerald-500/80 text-white hover:bg-emerald-500'
+                  }`}
+                >
+                  {cryptoEnabled ? 'Disable 24/7 Crypto Mode' : 'Enable 24/7 Crypto Mode'}
+                </button>
+                <button onClick={handleCryptoSettingsSave} className="btn-primary w-full">Save Crypto Settings</button>
+              </div>
             </section>
 
             <section className="card">

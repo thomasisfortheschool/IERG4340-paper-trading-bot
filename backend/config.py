@@ -145,9 +145,23 @@ class ConfigManager:
                 "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
                 "leverage": 1.0,
                 "max_position_size_pct": 5.0,
+                "tick_seconds": 1,
                 "grid_step_pct": 0.0015,
                 "grid_max_legs_per_pair": 3,
                 "grid_take_profit_steps": 1,
+            },
+            "crypto": {
+                "enabled": False,
+                "symbols": ["BTC-USD", "ETH-USD"],
+                "max_position_size_pct": 2.5,
+                "max_symbol_exposure_pct": 3.0,
+                "min_notional_usd": 50.0,
+                "daily_loss_limit_usd": 750.0,
+                "grid_step_pct": 0.003,
+                "grid_max_legs_per_symbol": 3,
+                "grid_take_profit_steps": 1,
+                "risk_acknowledged": False,
+                "advanced_user_confirmed": False,
             },
         }
     

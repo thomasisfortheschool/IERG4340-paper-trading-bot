@@ -12,28 +12,32 @@ export default function Home() {
 
   useEffect(() => {
     const fetchInitialData = async () => {
-      try {
-        setSelectedBroker('ibkr');
-        const [accountRes, configRes] = await Promise.all([
-          accountApi.getSnapshot(),
-          configApi.getCurrent(),
-        ]);
+      setSelectedBroker('ibkr');
 
-        const brokerRes = await statusApi.getBrokerStatus();
-        const brokerName = String(brokerRes.data?.broker || 'demo').toLowerCase();
-        const normalized = brokerName.includes('ibkr') ? 'ibkr' : brokerName.includes('alpaca') ? 'alpaca' : 'demo';
-        
-        setAccount(accountRes.data);
-        setCurrentMode(configRes.data.mode || 'balanced');
-        setSelectedBroker(normalized);
-      } catch (error) {
-        console.error('Failed to fetch initial data:', error);
-      } finally {
-        setLoading(false);
+      const [accountRes, configRes, brokerRes] = await Promise.allSettled([
+        accountApi.getSnapshot(),
+        configApi.getCurrent(),
+        statusApi.getBrokerStatus(),
+      ]);
+
+      if (accountRes.status === 'fulfilled') {
+        setAccount(accountRes.value.data);
       }
+
+      if (configRes.status === 'fulfilled') {
+        setCurrentMode(configRes.value.data?.mode || 'balanced');
+      }
+
+      if (brokerRes.status === 'fulfilled') {
+        const brokerName = String(brokerRes.value.data?.broker || 'ibkr').toLowerCase();
+        const normalized = brokerName.includes('ibkr') ? 'ibkr' : brokerName.includes('alpaca') ? 'alpaca' : 'ibkr';
+        setSelectedBroker(normalized);
+      }
+
+      setLoading(false);
     };
 
-    fetchInitialData();
+    void fetchInitialData().finally(() => setLoading(false));
   }, [setAccount, setCurrentMode, setSelectedBroker]);
 
   if (loading) {

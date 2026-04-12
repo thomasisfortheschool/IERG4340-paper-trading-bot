@@ -170,9 +170,25 @@ export default function StrategyCustomizationPanel() {
       }
 
       const res = await backtestApi.run(symbol, strategyName, Math.max(30, Math.min(backtestLookbackDays, 1000)));
+      const payload = res.data || {};
+      if (payload.error) {
+        setBacktestError(String(payload.error));
+        setBacktestResult(null);
+        return;
+      }
+
       setBacktestResult({
-        ...(res.data.result || {}),
-        diagnostics: res.data.diagnostics || null,
+        win_rate: Number(payload.win_rate || 0),
+        winning_trades: Number(payload.winning_trades || 0),
+        losing_trades: Number(payload.losing_trades || 0),
+        total_trades: Number(payload.total_trades || 0),
+        total_pnl: Number(payload.total_pnl || 0),
+        total_return: Number(payload.total_pnl_pct || 0),
+        final_capital: Number(payload.final_capital || 0),
+        avg_win: Number(payload.avg_win || 0),
+        avg_loss: Number(payload.avg_loss || 0),
+        message: String(payload.message || ''),
+        resolved_strategy: String(payload.resolved_strategy || strategyName),
       });
     } catch (error: any) {
       setBacktestError(error?.response?.data?.error || error?.message || 'Backtest failed');
@@ -395,43 +411,45 @@ export default function StrategyCustomizationPanel() {
             <div className="grid md:grid-cols-3 gap-4">
               <div className="rounded-lg bg-slate-900/40 p-3 border border-slate-700">
                 <p className="text-xs text-slate-400 uppercase">Win Rate</p>
-                <p className="text-2xl font-bold text-cyan-300">{backtestResult.win_rate}%</p>
+                <p className="text-2xl font-bold text-cyan-300">{Number(backtestResult.win_rate || 0).toFixed(1)}%</p>
                 <p className="text-xs text-slate-400 mt-1">
                   {backtestResult.winning_trades} wins, {backtestResult.losing_trades} losses
                 </p>
               </div>
               <div className="rounded-lg bg-slate-900/40 p-3 border border-slate-700">
-                <p className="text-xs text-slate-400 uppercase">Sharpe Ratio</p>
-                <p className={`text-2xl font-bold ${backtestResult.sharpe_ratio > 1 ? 'text-emerald-300' : 'text-yellow-300'}`}>
-                  {backtestResult.sharpe_ratio}
+                <p className="text-xs text-slate-400 uppercase">Total Trades</p>
+                <p className="text-2xl font-bold text-slate-100">
+                  {Number(backtestResult.total_trades || 0)}
                 </p>
-                <p className="text-xs text-slate-400 mt-1">Risk-adjusted returns</p>
+                <p className="text-xs text-slate-400 mt-1">Resolved strategy: {backtestResult.resolved_strategy}</p>
               </div>
               <div className="rounded-lg bg-slate-900/40 p-3 border border-slate-700">
                 <p className="text-xs text-slate-400 uppercase">Total Return</p>
                 <p className={`text-2xl font-bold ${backtestResult.total_return > 0 ? 'text-emerald-300' : 'text-loss'}`}>
-                  {backtestResult.total_return}%
+                  {backtestResult.total_return.toFixed(2)}%
                 </p>
-                <p className="text-xs text-slate-400 mt-1">Max DD: {backtestResult.max_drawdown}%</p>
+                <p className="text-xs text-slate-400 mt-1">P&L: ${Number(backtestResult.total_pnl || 0).toFixed(2)}</p>
               </div>
             </div>
 
-            {backtestResult?.diagnostics?.status === 'no_trades' && (
+            <div className="grid md:grid-cols-3 gap-4">
+              <div className="rounded-lg bg-slate-900/30 p-3 border border-slate-700">
+                <p className="text-xs text-slate-400 uppercase">Avg Win</p>
+                <p className="text-lg font-semibold text-emerald-300">${Number(backtestResult.avg_win || 0).toFixed(2)}</p>
+              </div>
+              <div className="rounded-lg bg-slate-900/30 p-3 border border-slate-700">
+                <p className="text-xs text-slate-400 uppercase">Avg Loss</p>
+                <p className="text-lg font-semibold text-rose-300">${Number(backtestResult.avg_loss || 0).toFixed(2)}</p>
+              </div>
+              <div className="rounded-lg bg-slate-900/30 p-3 border border-slate-700">
+                <p className="text-xs text-slate-400 uppercase">Final Capital</p>
+                <p className="text-lg font-semibold text-cyan-200">${Number(backtestResult.final_capital || 0).toFixed(2)}</p>
+              </div>
+            </div>
+
+            {backtestResult.message && (
               <div className="rounded-lg border border-amber-600/60 bg-amber-900/15 p-3">
-                <p className="text-sm font-semibold text-amber-200">Why this backtest looks empty</p>
-                <p className="text-xs text-amber-100/90 mt-1">{backtestResult.diagnostics.message}</p>
-                {backtestResult.diagnostics.signal_scan && (
-                  <p className="text-xs text-amber-100/80 mt-2">
-                    Signal scan: strict {backtestResult.diagnostics.signal_scan.strict_signals}, relaxed {backtestResult.diagnostics.signal_scan.relaxed_signals}, bars {backtestResult.diagnostics.signal_scan.bars_evaluated}.
-                  </p>
-                )}
-                {Array.isArray(backtestResult.diagnostics.suggestions) && backtestResult.diagnostics.suggestions.length > 0 && (
-                  <ul className="list-disc list-inside text-xs text-amber-100/90 mt-2 space-y-1">
-                    {backtestResult.diagnostics.suggestions.map((item: string, idx: number) => (
-                      <li key={idx}>{item}</li>
-                    ))}
-                  </ul>
-                )}
+                <p className="text-xs text-amber-100/90">{backtestResult.message}</p>
               </div>
             )}
           </div>

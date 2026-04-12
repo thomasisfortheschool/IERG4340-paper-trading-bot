@@ -210,50 +210,57 @@ export default function ScreeningPanel() {
     const fetchScreeningResults = async () => {
       setLoading(true);
       setFetchError('');
-      try {
-        const healthRes = await statusApi.getHealth();
-        setBackendOnline(healthRes.data?.status === 'healthy');
+      const healthResult = await statusApi.getHealth().catch(() => null);
+      const healthy = healthResult?.data?.status === 'healthy';
+      setBackendOnline(healthy);
 
-        const [stocksRes, callsRes, forexRes] = await Promise.allSettled([
-          screeningApi.blowupStocks(appliedFilters),
-          screeningApi.coveredCalls(),
-          screeningApi.forex(),
-        ]);
-
-        if (stocksRes.status === 'fulfilled') {
-          setBlowupStocks(stocksRes.value.data.candidates || []);
-          setStocksSource(String(stocksRes.value.data?.meta?.source || 'unknown'));
-        } else {
-          setBlowupStocks([]);
-          setStocksSource('unavailable');
-        }
-
-        if (callsRes.status === 'fulfilled') {
-          setCoveredCalls(callsRes.value.data.opportunities || []);
-          setCallsSource(String(callsRes.value.data?.meta?.source || 'unknown'));
-        } else {
-          setCoveredCalls([]);
-          setCallsSource('unavailable');
-        }
-
-        if (forexRes.status === 'fulfilled') {
-          setForex(forexRes.value.data.opportunities || []);
-          setForexSource(String(forexRes.value.data?.meta?.source || 'unknown'));
-        } else {
-          setForex([]);
-          setForexSource('unavailable');
-        }
-
-        if (stocksRes.status === 'rejected' && callsRes.status === 'rejected' && forexRes.status === 'rejected') {
-          setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
-        }
-      } catch (error) {
-        console.error('Failed to fetch screening results:', error);
-        setBackendOnline(false);
+      if (!healthy) {
+        setBlowupStocks([]);
+        setCoveredCalls([]);
+        setForex([]);
+        setStocksSource('unavailable');
+        setCallsSource('unavailable');
+        setForexSource('unavailable');
         setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
-      } finally {
         setLoading(false);
+        return;
       }
+
+      const [stocksRes, callsRes, forexRes] = await Promise.allSettled([
+        screeningApi.blowupStocks(appliedFilters),
+        screeningApi.coveredCalls(),
+        screeningApi.forex(),
+      ]);
+
+      if (stocksRes.status === 'fulfilled') {
+        setBlowupStocks(stocksRes.value.data.candidates || []);
+        setStocksSource(String(stocksRes.value.data?.meta?.source || 'unknown'));
+      } else {
+        setBlowupStocks([]);
+        setStocksSource('unavailable');
+      }
+
+      if (callsRes.status === 'fulfilled') {
+        setCoveredCalls(callsRes.value.data.opportunities || []);
+        setCallsSource(String(callsRes.value.data?.meta?.source || 'unknown'));
+      } else {
+        setCoveredCalls([]);
+        setCallsSource('unavailable');
+      }
+
+      if (forexRes.status === 'fulfilled') {
+        setForex(forexRes.value.data.opportunities || []);
+        setForexSource(String(forexRes.value.data?.meta?.source || 'unknown'));
+      } else {
+        setForex([]);
+        setForexSource('unavailable');
+      }
+
+      if (stocksRes.status === 'rejected' && callsRes.status === 'rejected' && forexRes.status === 'rejected') {
+        setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
+      }
+
+      setLoading(false);
     };
 
     fetchScreeningResults();

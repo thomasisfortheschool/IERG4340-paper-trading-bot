@@ -11,6 +11,7 @@ import threading
 import time
 import socket
 import random
+import uuid
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -72,18 +73,38 @@ state = {
     "bot_last_run": None,
     "bot_last_error": None,
     "bot_cycle_count": 0,
+    "bot_interval_seconds": 60,
+    "forex_tick_seconds": 1,
+    "forex_last_tick": None,
     "bot_dry_run": os.getenv("AUTO_EXECUTE_TRADES", "true").lower() != "true",
     "broker_runtime_config": {},
     "bot_logs": deque(maxlen=300),
     "bot_log_seq": 0,
+    "strategy_audit": {
+        "blowup": {"last_scan": None, "candidates": 0, "execution": "idle", "message": "No cycle yet"},
+        "covered_call": {"last_scan": None, "candidates": 0, "execution": "idle", "message": "No cycle yet"},
+        "forex_grid": {"last_tick": None, "execution": "idle", "message": "No tick yet"},
+    },
     "simulated_trade_logs": deque(maxlen=500),
     "forex_grid_state": {"pairs": {}, "last_cycle": None},
     "last_ib_client_id": None,
+    "daily_pnl_limit": 1000.0,  # Stop trading if daily loss exceeds this
+    "daily_pnl_current": 0.0,  # Today's realized P&L
+    "daily_pnl_date": datetime.now().strftime("%Y-%m-%d"),  # Track which day
+    "daily_pnl_trading_halted": False,  # Is trading halted due to daily loss?
+    "crypto_daily_loss_limit": 750.0,
+    "crypto_daily_loss_current": 0.0,
+    "crypto_daily_loss_date": datetime.now().strftime("%Y-%m-%d"),
+    "crypto_daily_loss_halted": False,
 }
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 TRADE_HISTORY_FILE = BACKEND_ROOT / "data" / "trade_history.json"
+WATCHLISTS_FILE = BACKEND_ROOT / "data" / "watchlists.json"
+SIM_PORTFOLIOS_FILE = BACKEND_ROOT / "data" / "simulated_portfolios.json"
 TRADE_HISTORY_LOCK = threading.Lock()
+WATCHLISTS_LOCK = threading.Lock()
+SIM_PORTFOLIOS_LOCK = threading.Lock()
 
 
 def _load_persisted_trade_logs() -> list[dict[str, Any]]:
@@ -119,6 +140,602 @@ def _append_persisted_trade_logs(new_rows: list[dict[str, Any]]) -> None:
         existing = _load_persisted_trade_logs()
         existing.extend([row for row in new_rows if isinstance(row, dict)])
         _save_persisted_trade_logs(existing)
+
+
+def _load_json_list(file_path: Path) -> list[dict[str, Any]]:
+    try:
+        if not file_path.exists():
+            return []
+        with file_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+    except Exception as e:
+        logging.getLogger(__name__).warning("Failed to load %s: %s", file_path.name, e)
+    return []
+
+
+def _save_json_list(file_path: Path, rows: list[dict[str, Any]]) -> None:
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with file_path.open("w", encoding="utf-8") as handle:
+            json.dump(rows, handle, indent=2)
+    except Exception as e:
+        logging.getLogger(__name__).warning("Failed to save %s: %s", file_path.name, e)
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def _normalize_symbol_text(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _parse_iso_date(value: Any) -> str:
+    if value is None:
+        return datetime.now().date().isoformat()
+    text = str(value).strip()
+    if not text:
+        return datetime.now().date().isoformat()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        return datetime.now().date().isoformat()
+
+
+def _resolve_market_symbol(symbol: str) -> str:
+    raw = _normalize_symbol_text(symbol)
+    if not raw:
+        return raw
+    if any(raw.endswith(suffix) for suffix in (".HK", ".T", ".KS", ".X")) or raw.endswith("=X"):
+        return raw
+    if len(raw) == 6 and raw.isalpha() and raw[:3] in {"EUR", "GBP", "AUD", "NZD", "USD"}:
+        return f"{raw}=X"
+    return raw
+
+
+def _get_latest_market_price(symbol: str) -> float:
+    ticker_symbol = _resolve_market_symbol(symbol)
+    if not ticker_symbol:
+        return 0.0
+
+    try:
+        hist = yf.Ticker(ticker_symbol).history(period="5d", interval="1d")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = hist["Close"].dropna()
+            if not closes.empty:
+                return float(closes.iloc[-1])
+    except Exception:
+        pass
+
+    try:
+        hist = yf.Ticker(ticker_symbol).history(period="1d", interval="5m")
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = hist["Close"].dropna()
+            if not closes.empty:
+                return float(closes.iloc[-1])
+    except Exception:
+        pass
+
+    return 0.0
+
+
+def _current_account_total_value() -> float:
+    if state.get("broker") is None:
+        try:
+            return float(MockPortfolioGenerator().generate_account_snapshot().get("total_value", 100000.0) or 100000.0)
+        except Exception:
+            return 100000.0
+
+    try:
+        account = run_async(state["broker"].get_account_snapshot())
+        return float(getattr(account, "total_value", 0.0) or 0.0) or 100000.0
+    except Exception:
+        return 100000.0
+
+
+def _decorate_watchlist(row: dict[str, Any]) -> dict[str, Any]:
+    symbols = sorted({ _normalize_symbol_text(symbol) for symbol in row.get("symbols", []) if _normalize_symbol_text(symbol) })
+    decorated = dict(row)
+    decorated["symbols"] = symbols
+    decorated["symbol_count"] = len(symbols)
+    decorated["updated_at"] = decorated.get("updated_at") or decorated.get("created_at")
+    return decorated
+
+
+def _decorate_portfolio(row: dict[str, Any]) -> dict[str, Any]:
+    portfolio = dict(row)
+    holdings = []
+    invested = 0.0
+    market_value = 0.0
+    unrealized = 0.0
+
+    for holding in portfolio.get("holdings", []) or []:
+        symbol = _normalize_symbol_text(holding.get("symbol"))
+        shares = float(holding.get("shares", 0) or 0)
+        buy_price = float(holding.get("buy_price", 0) or 0)
+        current_price = float(holding.get("current_price", 0) or 0)
+        if current_price <= 0:
+            current_price = _get_latest_market_price(symbol)
+
+        cost_basis = shares * buy_price
+        current_value = shares * current_price
+        pnl = current_value - cost_basis
+        pnl_pct = (pnl / cost_basis * 100.0) if cost_basis else 0.0
+
+        holdings.append(
+            {
+                **holding,
+                "symbol": symbol,
+                "shares": shares,
+                "buy_price": round(buy_price, 2),
+                "current_price": round(current_price, 4),
+                "cost_basis": round(cost_basis, 2),
+                "market_value": round(current_value, 2),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+            }
+        )
+        invested += cost_basis
+        market_value += current_value
+        unrealized += pnl
+
+    cash = float(portfolio.get("cash", 0) or 0)
+    total_value = cash + market_value
+
+    portfolio["holdings"] = holdings
+    portfolio["holdings_count"] = len(holdings)
+    portfolio["invested_value"] = round(invested, 2)
+    portfolio["market_value"] = round(market_value, 2)
+    portfolio["total_value"] = round(total_value, 2)
+    portfolio["unrealized_pnl"] = round(unrealized, 2)
+    portfolio["unrealized_pnl_pct"] = round((unrealized / invested * 100.0) if invested else 0.0, 2)
+    portfolio["cash"] = round(cash, 2)
+    portfolio["updated_at"] = portfolio.get("updated_at") or portfolio.get("created_at")
+    return portfolio
+
+
+# ============================================================================
+# Trade Logging & Metrics
+# ============================================================================
+
+def _log_trade(
+    symbol: str,
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    strategy: str = "unknown",
+    entry_reason: str = "",
+    mode: str = "simulated",
+    broker: str = "demo",
+) -> dict[str, Any]:
+    """
+    Log a completed trade to the persistent trade history.
+    Returns the trade record.
+    """
+    now = datetime.now()
+    pnl = (exit_price - entry_price) * quantity
+    pnl_pct = ((exit_price - entry_price) / entry_price * 100.0) if entry_price > 0 else 0.0
+    
+    trade_record = {
+        "id": str(uuid.uuid4()),
+        "symbol": _normalize_symbol_text(symbol),
+        "entry_price": round(entry_price, 4),
+        "exit_price": round(exit_price, 4),
+        "quantity": quantity,
+        "entry_reason": str(entry_reason),
+        "strategy": str(strategy),
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "mode": mode,
+        "broker": broker,
+        "timestamp": now.isoformat(),
+        "date": now.strftime("%Y-%m-%d"),
+    }
+    
+    _append_persisted_trade_logs([trade_record])
+    logger.info(f"Trade logged: {symbol} {quantity}@${entry_price} -> ${exit_price} = {pnl_pct:+.1f}%")
+    
+    return trade_record
+
+
+def _get_trade_metrics(trades: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """
+    Calculate trading metrics from trade history.
+    Returns: win_rate, avg_win, avg_loss, total_pnl, sharpe_ratio, and more.
+    """
+    if trades is None:
+        trades = _load_persisted_trade_logs()
+    
+    if not trades:
+        return {
+            "win_rate": 0.0,
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "total_pnl": 0.0,
+            "avg_pnl_pct": 0.0,
+            "largest_win": 0.0,
+            "largest_loss": 0.0,
+            "sharpe_ratio": 0.0,
+            "profit_factor": 0.0,
+        }
+    
+    total_trades = len(trades)
+    pnls = [float(t.get("pnl", 0)) for t in trades]
+    pnl_pcts = [float(t.get("pnl_pct", 0)) for t in trades]
+    
+    winning = [p for p in pnls if p > 0]
+    losing = [p for p in pnls if p < 0]
+    
+    total_pnl = sum(pnls)
+    total_wins = sum(winning)
+    total_losses = sum(losing)
+    
+    win_count = len(winning)
+    loss_count = len(losing)
+    win_rate = (win_count / total_trades * 100.0) if total_trades > 0 else 0.0
+    avg_win = (total_wins / win_count) if win_count > 0 else 0.0
+    avg_loss = (total_losses / loss_count) if loss_count > 0 else 0.0
+    avg_pnl_pct = (sum(pnl_pcts) / total_trades) if total_trades > 0 else 0.0
+    
+    largest_win = max(pnls) if pnls else 0.0
+    largest_loss = min(pnls) if pnls else 0.0
+    
+    # Sharpe Ratio = mean_return / std_dev * sqrt(252)
+    if len(pnl_pcts) > 1:
+        import statistics
+        try:
+            std_dev = statistics.stdev(pnl_pcts)
+            sharpe = (avg_pnl_pct / std_dev * (252 ** 0.5)) if std_dev > 0 else 0.0
+        except:
+            sharpe = 0.0
+    else:
+        sharpe = 0.0
+    
+    profit_factor = abs(total_wins / abs(total_losses)) if total_losses != 0 else (1.0 if total_wins > 0 else 0.0)
+    
+    return {
+        "win_rate": round(win_rate, 2),
+        "total_trades": total_trades,
+        "winning_trades": win_count,
+        "losing_trades": loss_count,
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "total_pnl": round(total_pnl, 2),
+        "avg_pnl_pct": round(avg_pnl_pct, 2),
+        "largest_win": round(largest_win, 2),
+        "largest_loss": round(largest_loss, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "profit_factor": round(profit_factor, 2),
+    }
+
+
+def _get_performance_by_strategy(trades: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    """
+    Group trades by strategy and calculate metrics for each.
+    Returns: {strategy_name: {metrics}, ...}
+    """
+    if trades is None:
+        trades = _load_persisted_trade_logs()
+    
+    by_strategy: dict[str, list] = {}
+    for trade in trades:
+        strat = trade.get("strategy", "unknown")
+        if strat not in by_strategy:
+            by_strategy[strat] = []
+        by_strategy[strat].append(trade)
+    
+    result = {}
+    for strategy, strat_trades in by_strategy.items():
+        result[strategy] = _get_trade_metrics(strat_trades)
+    
+    return result
+
+
+def _get_daily_pnl(trades: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """
+    Aggregate trades by day and calculate daily P&L.
+    Returns list of {date, trades_count, pnl, pnl_pct}
+    """
+    if trades is None:
+        trades = _load_persisted_trade_logs()
+    
+    daily: dict[str, list] = {}
+    for trade in trades:
+        date = trade.get("date", "unknown")
+        if date not in daily:
+            daily[date] = []
+        daily[date].append(trade)
+    
+    result = []
+    for date in sorted(daily.keys(), reverse=True):
+        day_trades = daily[date]
+        day_pnl = sum(float(t.get("pnl", 0)) for t in day_trades)
+        day_pnl_pct = sum(float(t.get("pnl_pct", 0)) for t in day_trades) / len(day_trades) if day_trades else 0.0
+        
+        result.append({
+            "date": date,
+            "trades_count": len(day_trades),
+            "pnl": round(day_pnl, 2),
+            "pnl_pct": round(day_pnl_pct, 2),
+        })
+    
+    return result
+
+
+# ============================================================================
+# Backtesting & Overnight Summary
+# ============================================================================
+
+def _backtest_strategy(
+    symbol: str,
+    strategy: str,
+    days_lookback: int = 60,
+    initial_capital: float = 10000.0,
+) -> dict[str, Any]:
+    """
+    Backtest a strategy on historical data.
+    Returns: {symbol, strategy, backtest_results...}
+    """
+    try:
+        # Fetch historical data
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=f"{max(30, min(days_lookback, 365))}d")
+        
+        if hist.empty or len(hist) < 20:
+            return {"error": f"Insufficient data for {symbol}", "symbol": symbol, "strategy": strategy}
+        
+        prices = hist['Close'].values
+        rsi_values = []
+        
+        # Calculate RSI for momentum/mean reversion strategies
+        for i in range(len(prices)):
+            if i < 14:
+                rsi_values.append(None)
+            else:
+                price_list = prices[max(0, i-13):i+1].tolist()
+                deltas = [price_list[j] - price_list[j-1] for j in range(1, len(price_list))]
+                gains = [d if d > 0 else 0 for d in deltas]
+                losses = [-d if d < 0 else 0 for d in deltas]
+                avg_gain = sum(gains) / 14
+                avg_loss = sum(losses) / 14
+                rs = avg_gain / avg_loss if avg_loss > 0 else 1.0
+                rsi = 100 - (100 / (1 + rs))
+                rsi_values.append(rsi)
+        
+        # Simulate trades based on strategy
+        trades = []
+        position = None
+        cash = initial_capital
+        
+        for i in range(20, len(prices)):
+            price = prices[i]
+            rsi = rsi_values[i]
+            
+            # Entry logic based on strategy
+            entry_price = None
+            
+            if strategy == "momentum" and not position:
+                if rsi and 50 <= rsi <= 70:
+                    shares = int(cash / price * 0.5)  # Use 50% of cash
+                    if shares > 0:
+                        position = {"entry": price, "shares": shares, "rsi": rsi}
+                        cash -= shares * price
+            
+            elif strategy == "swing" and not position:
+                if rsi and rsi < 30:
+                    shares = int(cash / price * 0.5)
+                    if shares > 0:
+                        position = {"entry": price, "shares": shares, "rsi": rsi}
+                        cash -= shares * price
+            
+            elif strategy == "mean_reversion" and not position:
+                if rsi and rsi < 30:
+                    shares = int(cash / price * 0.3)
+                    if shares > 0:
+                        position = {"entry": price, "shares": shares, "signal": "buy"}
+                        cash -= shares * price
+            
+            # Exit logic
+            if position:
+                pnl_pct = (price - position["entry"]) / position["entry"] * 100
+                
+                should_exit = False
+                if strategy == "momentum" and pnl_pct >= 6:
+                    should_exit = True
+                elif strategy == "momentum" and pnl_pct <= -3:
+                    should_exit = True
+                elif strategy == "swing" and pnl_pct >= 5:
+                    should_exit = True
+                elif strategy == "swing" and pnl_pct <= -2.5:
+                    should_exit = True
+                elif strategy == "mean_reversion" and pnl_pct >= 3:
+                    should_exit = True
+                elif strategy == "mean_reversion" and pnl_pct <= -1.5:
+                    should_exit = True
+                
+                if should_exit:
+                    pnl_dollars = (price - position["entry"]) * position["shares"]
+                    cash += position["shares"] * price
+                    trades.append({
+                        "entry": round(position["entry"], 4),
+                        "exit": round(price, 4),
+                        "shares": position["shares"],
+                        "pnl": round(pnl_dollars, 2),
+                        "pnl_pct": round(pnl_pct, 2),
+                    })
+                    position = None
+        
+        # Close any remaining position at last price
+        final_price = prices[-1]
+        if position:
+            pnl_dollars = (final_price - position["entry"]) * position["shares"]
+            cash += position["shares"] * final_price
+            trades.append({
+                "entry": round(position["entry"], 4),
+                "exit": round(final_price, 4),
+                "shares": position["shares"],
+                "pnl": round(pnl_dollars, 2),
+                "pnl_pct": round((final_price - position["entry"]) / position["entry"] * 100, 2),
+            })
+        
+        # Calculate metrics
+        if trades:
+            total_pnl = sum(t["pnl"] for t in trades)
+            wins = [t for t in trades if t["pnl"] > 0]
+            losses = [t for t in trades if t["pnl"] < 0]
+            win_rate = len(wins) / len(trades) * 100 if trades else 0
+            
+            return {
+                "symbol": symbol,
+                "strategy": strategy,
+                "backtest_complete": True,
+                "trades": trades,
+                "total_trades": len(trades),
+                "winning_trades": len(wins),
+                "losing_trades": len(losses),
+                "win_rate": round(win_rate, 1),
+                "total_pnl": round(total_pnl, 2),
+                "total_pnl_pct": round((cash - initial_capital) / initial_capital * 100, 2),
+                "final_capital": round(cash, 2),
+                "avg_win": round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else 0,
+                "avg_loss": round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0,
+            }
+        else:
+            return {
+                "symbol": symbol,
+                "strategy": strategy,
+                "backtest_complete": True,
+                "trades": [],
+                "total_trades": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "win_rate": 0,
+                "total_pnl": 0,
+                "total_pnl_pct": 0,
+                "final_capital": round(cash, 2),
+                "message": "No trades generated during backtest period",
+            }
+    
+    except Exception as e:
+        logger.error(f"Backtest error for {symbol}: {e}")
+        return {"error": str(e), "symbol": symbol, "strategy": strategy}
+
+
+def _get_overnight_summary() -> dict[str, Any]:
+    """
+    Get summary of what bot did since yesterday (overnight trading).
+    Returns: trades, P&L, performance by strategy, alerts
+    """
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    
+    # Get trades from today
+    all_trades = _load_persisted_trade_logs()
+    today_trades = [t for t in all_trades if t.get("date") == today_str]
+    
+    # Group by strategy
+    by_strategy: dict[str, list] = {}
+    for trade in today_trades:
+        strat = trade.get("strategy", "unknown")
+        if strat not in by_strategy:
+            by_strategy[strat] = []
+        by_strategy[strat].append(trade)
+    
+    # Calculate stats
+    total_pnl = sum(float(t.get("pnl", 0)) for t in today_trades)
+    total_pnl_pct = sum(float(t.get("pnl_pct", 0)) for t in today_trades) / len(today_trades) if today_trades else 0
+    winning_trades = len([t for t in today_trades if t.get("pnl", 0) > 0])
+    losing_trades = len([t for t in today_trades if t.get("pnl", 0) < 0])
+    
+    # Get yesterday's P&L for comparison
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday_trades = [t for t in all_trades if t.get("date") == yesterday]
+    yesterday_pnl = sum(float(t.get("pnl", 0)) for t in yesterday_trades)
+    
+    return {
+        "date": today_str,
+        "trades_count": len(today_trades),
+        "winning_trades": winning_trades,
+        "losing_trades": losing_trades,
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round(total_pnl_pct, 2),
+        "win_rate": round(winning_trades / len(today_trades) * 100, 1) if today_trades else 0,
+        "by_strategy": {
+            strat: {
+                "trades": len(trades),
+                "pnl": round(sum(float(t.get("pnl", 0)) for t in trades), 2),
+                "wins": len([t for t in trades if t.get("pnl", 0) > 0]),
+            }
+            for strat, trades in by_strategy.items()
+        },
+        "recent_trades": today_trades[-5:],  # Last 5 trades
+        "comparison": {
+            "yesterday_pnl": round(yesterday_pnl, 2),
+            "improvement": round(total_pnl - yesterday_pnl, 2),
+        },
+        "alerts": _generate_overnight_alerts(today_trades, state.get("daily_pnl_limit", 1000)),
+    }
+
+
+def _generate_overnight_alerts(trades: list[dict[str, Any]], daily_limit: float) -> list[str]:
+    """Generate alerts based on overnight trading activity."""
+    alerts = []
+    
+    if not trades:
+        alerts.append("No trades executed overnight")
+        return alerts
+    
+    total_loss = sum(float(t.get("pnl", 0)) for t in trades if t.get("pnl", 0) < 0)
+    
+    if abs(total_loss) > daily_limit:
+        alerts.append(f"⚠️ Daily loss limit exceeded: ${abs(total_loss):.2f} > ${daily_limit:.2f}")
+    
+    win_rate = len([t for t in trades if t.get("pnl", 0) > 0]) / len(trades) * 100
+    if win_rate < 30 and len(trades) > 5:
+        alerts.append(f"⚠️ Low win rate: {win_rate:.0f}% (consider adjusting stop losses)")
+    
+    largest_loss = min([t.get("pnl", 0) for t in trades], default=0)
+    if largest_loss < -500:
+        alerts.append(f"🔴 Large loss detected: ${largest_loss:.2f}")
+    
+    if len(trades) > 20:
+        alerts.append(f"✓ High activity: {len(trades)} trades executed")
+    
+    return alerts
+
+
+
+
+def _find_row_by_id(rows: list[dict[str, Any]], row_id: str) -> dict[str, Any] | None:
+    for row in rows:
+        if str(row.get("id")) == str(row_id):
+            return row
+    return None
+
+
+def _load_watchlists() -> list[dict[str, Any]]:
+    return [_decorate_watchlist(row) for row in _load_json_list(WATCHLISTS_FILE)]
+
+
+def _save_watchlists(rows: list[dict[str, Any]]) -> None:
+    _save_json_list(WATCHLISTS_FILE, rows)
+
+
+def _load_simulated_portfolios() -> list[dict[str, Any]]:
+    return [_decorate_portfolio(row) for row in _load_json_list(SIM_PORTFOLIOS_FILE)]
+
+
+def _save_simulated_portfolios(rows: list[dict[str, Any]]) -> None:
+    _save_json_list(SIM_PORTFOLIOS_FILE, rows)
+
+
+state["watchlists"] = _load_watchlists()
+state["simulated_portfolios"] = _load_simulated_portfolios()
 
 
 state["simulated_trade_logs"] = deque(_load_persisted_trade_logs(), maxlen=500)
@@ -221,28 +838,48 @@ class BotRunner:
             return False
 
         self._stop_event.clear()
+        full_cycle_seconds = max(10, int(interval_seconds or 60))
+        state["bot_interval_seconds"] = full_cycle_seconds
 
         def _loop():
             logger.info("Automatic bot runner started")
             state["bot_running"] = True
+            next_full_cycle = time.time()
+            next_forex_tick = time.time()
             append_bot_log(
                 "Bot runner started",
                 details={
                     "execution_mode": state.get("execution_mode"),
                     "dry_run": state.get("bot_dry_run"),
-                    "interval_seconds": max(10, interval_seconds),
+                    "interval_seconds": full_cycle_seconds,
                 },
             )
             while not self._stop_event.is_set():
+                now = time.time()
                 try:
-                    state["bot_heartbeat"] = datetime.now().isoformat()
-                    self._run_cycle()
+                    cfg = (state["config_manager"] or ConfigManager()).load_user_config()
+                    forex_cfg = cfg.get("forex", {}) if isinstance(cfg, dict) else {}
+                    forex_tick_seconds = max(1, min(int(forex_cfg.get("tick_seconds", 1) or 1), 5))
+                    state["forex_tick_seconds"] = forex_tick_seconds
+
+                    if now >= next_forex_tick:
+                        self._run_forex_tick(cfg=cfg)
+                        next_forex_tick = now + forex_tick_seconds
+
+                    if now >= next_full_cycle:
+                        state["bot_heartbeat"] = datetime.now().isoformat()
+                        self._run_cycle(cfg_override=cfg, include_forex=False)
+                        next_full_cycle = now + full_cycle_seconds
+
                     state["bot_last_error"] = None
                 except Exception as e:
                     state["bot_last_error"] = str(e)
                     logger.error(f"Bot cycle error: {e}")
                     append_bot_log("Bot cycle failed", level="error", details={"error": str(e)})
-                time.sleep(max(10, interval_seconds))
+
+                sleep_until = min(next_forex_tick, next_full_cycle)
+                sleep_for = max(0.2, min(1.0, sleep_until - time.time()))
+                self._stop_event.wait(timeout=sleep_for)
 
             state["bot_running"] = False
             logger.info("Automatic bot runner stopped")
@@ -262,9 +899,9 @@ class BotRunner:
         state["bot_running"] = False
         return True
 
-    def _run_cycle(self):
+    def _run_cycle(self, cfg_override: dict[str, Any] | None = None, include_forex: bool = True):
         """Run one automated scan cycle and generate actions."""
-        cfg = (state["config_manager"] or ConfigManager()).load_user_config()
+        cfg = cfg_override if isinstance(cfg_override, dict) else (state["config_manager"] or ConfigManager()).load_user_config()
 
         # In manual mode we only provide data; no bot loop should operate.
         if state["execution_mode"] != "automatic":
@@ -324,8 +961,110 @@ class BotRunner:
             },
         )
 
-        # Covered-call-first behavior: never auto-buy shares to top up under-covered positions.
+        # Blowup-stock sleeve: scan and optionally place one entry order per cycle.
         actions = []
+        blowup_best = stocks[0] if stocks else None
+        blowup_symbol = str((blowup_best or {}).get("symbol") or "").upper().strip()
+        existing_stock_symbols = set(shares_by_symbol.keys())
+        blowup_allocation = cfg.get("allocation", {}) if isinstance(cfg, dict) else {}
+        blowup_allocation_pct = float(blowup_allocation.get("blowup_stocks_pct", 0.0) or 0.0)
+
+        blowup_execution = "idle"
+        blowup_message = "No blowup candidate found"
+        blowup_order_id = None
+        blowup_qty = 0
+
+        if blowup_best and blowup_symbol:
+            blowup_price = float(blowup_best.get("price", 0.0) or 0.0)
+            if blowup_symbol in existing_stock_symbols:
+                blowup_execution = "skipped"
+                blowup_message = f"Already holding {blowup_symbol}; not adding duplicate position"
+            elif blowup_price <= 0:
+                blowup_execution = "skipped"
+                blowup_message = f"Invalid price for {blowup_symbol}"
+            else:
+                account_total = 100000.0
+                try:
+                    if broker is not None:
+                        snap = run_async(broker.get_account_snapshot())
+                        account_total = float(getattr(snap, "total_value", 0.0) or 0.0) or account_total
+                except Exception:
+                    account_total = 100000.0
+
+                sleeve_capital = account_total * (blowup_allocation_pct / 100.0)
+                ticket_capital = max(2000.0, sleeve_capital * 0.20)
+                blowup_qty = max(1, int(ticket_capital / blowup_price))
+
+                if state.get("bot_dry_run", True):
+                    blowup_execution = "simulated"
+                    blowup_message = f"Simulated buy {blowup_qty} shares of {blowup_symbol}"
+                else:
+                    if broker is None:
+                        blowup_execution = "skipped"
+                        blowup_message = "No live broker connected"
+                    elif not hasattr(broker, "place_order"):
+                        blowup_execution = "skipped"
+                        blowup_message = "Broker does not support stock order placement"
+                    else:
+                        placed = run_async(broker.place_order(blowup_symbol, "buy", blowup_qty))
+                        if placed and getattr(placed, "status", "") != "failed":
+                            blowup_execution = "submitted"
+                            blowup_order_id = getattr(placed, "order_id", None)
+                            blowup_message = f"Submitted buy {blowup_qty} shares of {blowup_symbol}"
+                        else:
+                            blowup_execution = "failed"
+                            blowup_message = f"Broker rejected blowup-stock order for {blowup_symbol}"
+
+            actions.append(
+                {
+                    "type": "blowup_stock",
+                    "symbol": blowup_symbol,
+                    "action": "buy",
+                    "price": blowup_best.get("price"),
+                    "score": blowup_best.get("score"),
+                    "reason": blowup_best.get("reason", "top blowup candidate"),
+                    "quantity": blowup_qty,
+                    "execution": blowup_execution,
+                    "order_id": blowup_order_id,
+                    "message": blowup_message,
+                    "dry_run": state.get("bot_dry_run", True),
+                }
+            )
+
+            append_bot_log(
+                "Blowup stock candidate evaluated",
+                level="warning" if blowup_execution in {"failed", "skipped"} else "info",
+                details={
+                    "symbol": blowup_symbol,
+                    "score": blowup_best.get("score"),
+                    "execution": blowup_execution,
+                    "quantity": blowup_qty,
+                    "message": blowup_message,
+                    "order_id": blowup_order_id,
+                },
+            )
+        else:
+            actions.append(
+                {
+                    "type": "blowup_stock",
+                    "action": "idle",
+                    "execution": "idle",
+                    "message": "No blowup candidate found this cycle",
+                    "dry_run": state.get("bot_dry_run", True),
+                }
+            )
+
+        state["strategy_audit"]["blowup"] = {
+            "last_scan": datetime.now().isoformat(),
+            "candidates": len(stocks),
+            "top_symbol": blowup_symbol or None,
+            "top_score": (blowup_best or {}).get("score") if blowup_best else None,
+            "execution": blowup_execution,
+            "message": blowup_message,
+            "order_id": blowup_order_id,
+        }
+
+        # Covered-call-first behavior: never auto-buy shares to top up under-covered positions.
         top_call_symbol = calls[0].get("symbol") if calls else None
         if calls:
             best = calls[0]
@@ -414,6 +1153,14 @@ class BotRunner:
                 level="warning" if execution in {"failed", "skipped"} else "info",
                 details=details,
             )
+            state["strategy_audit"]["covered_call"] = {
+                "last_scan": datetime.now().isoformat(),
+                "candidates": len(calls),
+                "top_symbol": symbol,
+                "execution": execution,
+                "message": error or f"Covered call candidate evaluated for {symbol}",
+                "order_id": order_id,
+            }
         else:
             target = top_call_symbol or (eligible_cc_symbols[0] if eligible_cc_symbols else "SPY")
             actions.append(
@@ -433,6 +1180,14 @@ class BotRunner:
                 level="warning",
                 details={"target_symbol": target, "eligible_symbols": eligible_cc_symbols},
             )
+            state["strategy_audit"]["covered_call"] = {
+                "last_scan": datetime.now().isoformat(),
+                "candidates": len(calls),
+                "top_symbol": target,
+                "execution": "idle",
+                "message": f"No executable covered-call setup for {target}",
+                "order_id": None,
+            }
 
         # Keep forex strategy continuously active using grid trading,
         # with capital sized by the current mode's forex allocation.
@@ -440,7 +1195,7 @@ class BotRunner:
         allocation = cfg.get("allocation", {}) if isinstance(cfg, dict) else {}
         forex_alloc_pct = float(allocation.get("forex_pct", 0.0) or 0.0)
 
-        if forex_alloc_pct > 0:
+        if include_forex and forex_alloc_pct > 0:
             forex_summary, forex_trade_rows = self._run_forex_grid_cycle(
                 cfg=cfg,
                 broker=broker,
@@ -463,22 +1218,85 @@ class BotRunner:
                 _append_persisted_trade_logs(forex_trade_rows)
 
             append_bot_log(
-                "Forex grid cycle completed",
+                "24/7 grid cycle completed",
                 details={
                     "mode": mode_name,
                     "allocation_pct": round(forex_alloc_pct, 2),
                     "pairs": forex_summary.get("pairs_processed", 0),
+                    "crypto_symbols": forex_summary.get("crypto_symbols_processed", 0),
                     "opened": forex_summary.get("opened", 0),
                     "closed": forex_summary.get("closed", 0),
                     "realized_pnl": forex_summary.get("realized_pnl", 0.0),
                     "execution": "simulated" if state.get("bot_dry_run", True) else "live_paper",
                 },
             )
+            state["strategy_audit"]["forex_grid"] = {
+                "last_tick": datetime.now().isoformat(),
+                "execution": "simulated" if state.get("bot_dry_run", True) else "live_paper",
+                "message": f"Opened {forex_summary.get('opened', 0)}, closed {forex_summary.get('closed', 0)}",
+                "opened": forex_summary.get("opened", 0),
+                "closed": forex_summary.get("closed", 0),
+                "realized_pnl": forex_summary.get("realized_pnl", 0.0),
+            }
 
         state["portfolio_data"]["last_actions"] = actions
         state["bot_heartbeat"] = datetime.now().isoformat()
         state["bot_last_run"] = datetime.now().isoformat()
         state["bot_cycle_count"] += 1
+
+    def _run_forex_tick(self, cfg: dict[str, Any] | None = None):
+        """Run high-frequency forex grid tick independent of slower full scan cycle."""
+        if state["execution_mode"] != "automatic":
+            return
+
+        cfg = cfg if isinstance(cfg, dict) else (state["config_manager"] or ConfigManager()).load_user_config()
+        allocation = cfg.get("allocation", {}) if isinstance(cfg, dict) else {}
+        forex_alloc_pct = float(allocation.get("forex_pct", 0.0) or 0.0)
+
+        if forex_alloc_pct <= 0:
+            return
+
+        broker = state.get("broker")
+        forex_summary, forex_trade_rows = self._run_forex_grid_cycle(
+            cfg=cfg,
+            broker=broker,
+            allocation_pct=forex_alloc_pct,
+            dry_run=bool(state.get("bot_dry_run", True)),
+        )
+
+        if forex_trade_rows:
+            for row in forex_trade_rows:
+                state["simulated_trade_logs"].append(row)
+            _append_persisted_trade_logs(forex_trade_rows)
+
+        state["forex_last_tick"] = datetime.now().isoformat()
+        state["bot_last_run"] = state["forex_last_tick"]
+        state["bot_heartbeat"] = state["forex_last_tick"]
+        state["portfolio_data"]["last_forex_summary"] = {
+            "allocation_pct": round(forex_alloc_pct, 2),
+            "summary": forex_summary,
+            "tick_seconds": state.get("forex_tick_seconds", 1),
+        }
+
+        if forex_summary.get("opened", 0) > 0 or forex_summary.get("closed", 0) > 0:
+            append_bot_log(
+                "Forex grid tick executed",
+                details={
+                    "allocation_pct": round(forex_alloc_pct, 2),
+                    "opened": forex_summary.get("opened", 0),
+                    "closed": forex_summary.get("closed", 0),
+                    "realized_pnl": forex_summary.get("realized_pnl", 0.0),
+                },
+            )
+
+        state["strategy_audit"]["forex_grid"] = {
+            "last_tick": state["forex_last_tick"],
+            "execution": "simulated" if state.get("bot_dry_run", True) else "live_paper",
+            "message": f"Opened {forex_summary.get('opened', 0)}, closed {forex_summary.get('closed', 0)}",
+            "opened": forex_summary.get("opened", 0),
+            "closed": forex_summary.get("closed", 0),
+            "realized_pnl": forex_summary.get("realized_pnl", 0.0),
+        }
 
     def _run_forex_grid_cycle(
         self,
@@ -487,12 +1305,50 @@ class BotRunner:
         allocation_pct: float,
         dry_run: bool,
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """Run one forex grid cycle and return summary + closed-trade log rows."""
+        """Run one 24/7 grid cycle for forex and optional crypto symbols."""
         forex_cfg = cfg.get("forex", {}) if isinstance(cfg, dict) else {}
         pairs = list(forex_cfg.get("pairs") or ["EURUSD", "GBPUSD", "USDJPY"])
         grid_step_pct = float(forex_cfg.get("grid_step_pct", 0.0015) or 0.0015)
         max_legs = max(1, min(int(forex_cfg.get("grid_max_legs_per_pair", 3) or 3), 8))
         take_profit_steps = max(1, min(int(forex_cfg.get("grid_take_profit_steps", 1) or 1), 3))
+
+        crypto_cfg = cfg.get("crypto", {}) if isinstance(cfg, dict) else {}
+        crypto_enabled = bool(crypto_cfg.get("enabled", False))
+        crypto_advanced = bool(crypto_cfg.get("advanced_user_confirmed", False))
+        crypto_ack = bool(crypto_cfg.get("risk_acknowledged", False))
+        crypto_symbols = [
+            str(sym or "").upper().strip()
+            for sym in (crypto_cfg.get("symbols") or ["BTC-USD", "ETH-USD"])
+            if str(sym or "").strip()
+        ]
+        crypto_max_position_pct = float(crypto_cfg.get("max_position_size_pct", 2.5) or 2.5)
+        crypto_symbol_exposure_pct = float(
+            crypto_cfg.get("max_symbol_exposure_pct", crypto_max_position_pct) or crypto_max_position_pct
+        )
+        crypto_min_notional = float(crypto_cfg.get("min_notional_usd", 50.0) or 50.0)
+        crypto_daily_loss_limit = max(
+            50.0,
+            float(crypto_cfg.get("daily_loss_limit_usd", state.get("crypto_daily_loss_limit", 750.0)) or 750.0),
+        )
+        crypto_grid_step_pct = float(crypto_cfg.get("grid_step_pct", grid_step_pct * 2.0) or (grid_step_pct * 2.0))
+        crypto_max_legs = max(1, min(int(crypto_cfg.get("grid_max_legs_per_symbol", max_legs) or max_legs), 6))
+        crypto_take_profit_steps = max(
+            1,
+            min(int(crypto_cfg.get("grid_take_profit_steps", take_profit_steps) or take_profit_steps), 3),
+        )
+
+        if not (crypto_enabled and crypto_ack and crypto_advanced):
+            crypto_symbols = []
+
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        if state.get("crypto_daily_loss_date") != today_key:
+            state["crypto_daily_loss_date"] = today_key
+            state["crypto_daily_loss_current"] = 0.0
+            state["crypto_daily_loss_halted"] = False
+
+        state["crypto_daily_loss_limit"] = round(float(crypto_daily_loss_limit), 2)
+        if float(state.get("crypto_daily_loss_current", 0.0) or 0.0) <= -float(crypto_daily_loss_limit):
+            state["crypto_daily_loss_halted"] = True
 
         account_total = 100000.0
         try:
@@ -503,8 +1359,14 @@ class BotRunner:
             account_total = 100000.0
 
         grid_capital = max(5000.0, account_total * (allocation_pct / 100.0))
-        pair_budget = grid_capital / max(1, len(pairs))
+        forex_budget = grid_capital * (0.7 if crypto_symbols else 1.0)
+        crypto_budget = max(0.0, grid_capital - forex_budget)
+
+        pair_budget = forex_budget / max(1, len(pairs))
         per_leg_budget = pair_budget / max(1, max_legs * 2)
+
+        crypto_symbol_budget = crypto_budget / max(1, len(crypto_symbols))
+        crypto_per_leg_budget = crypto_symbol_budget / max(1, crypto_max_legs * 2)
 
         grid_state = state.setdefault("forex_grid_state", {"pairs": {}, "last_cycle": None})
         pair_states = grid_state.setdefault("pairs", {})
@@ -512,10 +1374,18 @@ class BotRunner:
         opened = 0
         closed = 0
         realized_total = 0.0
+        crypto_realized_cycle = 0.0
+        crypto_open_blocked = 0
+        crypto_halted_before = bool(state.get("crypto_daily_loss_halted", False))
         trade_rows: List[Dict[str, Any]] = []
 
+        def _symbol_notional_exposure(symbol_state: Dict[str, Any], mark_price: float) -> float:
+            longs = sum(max(0.0, float(leg.get("quantity", 0.0) or 0.0)) for leg in (symbol_state.get("open_longs") or []))
+            shorts = sum(max(0.0, float(leg.get("quantity", 0.0) or 0.0)) for leg in (symbol_state.get("open_shorts") or []))
+            return round((longs + shorts) * max(mark_price, 0.0), 2)
+
         for pair in pairs:
-            price = self._get_fx_spot_price(pair)
+            price = self._get_grid_spot_price("forex", pair)
             if price <= 0:
                 continue
 
@@ -527,15 +1397,26 @@ class BotRunner:
                     "open_longs": [],
                     "open_shorts": [],
                     "realized_pnl": 0.0,
+                    "asset_type": "forex",
                 },
             )
 
             anchor = float(pair_state.get("anchor", price) or price)
+            pair_state["last_price"] = round(float(price), 5)
+            pair_state["last_updated"] = datetime.now().isoformat()
+            pair_state["asset_type"] = "forex"
 
             # Keep grid continuously active: seed a starter leg when pair has no exposure.
             if not pair_state["open_longs"] and not pair_state["open_shorts"]:
                 starter_side = "buy" if (int(datetime.now().timestamp() // 60) + len(pair)) % 2 == 0 else "sell"
-                starter_submitted = self._submit_forex_grid_order(broker, pair, starter_side, qty, dry_run)
+                starter_submitted = self._submit_grid_order(
+                    broker=broker,
+                    symbol=pair,
+                    side=starter_side,
+                    quantity=qty,
+                    dry_run=dry_run,
+                    asset_type="forex",
+                )
                 if starter_submitted:
                     leg = {"entry_price": price, "quantity": qty, "opened_at": datetime.now().isoformat()}
                     if starter_side == "buy":
@@ -545,15 +1426,31 @@ class BotRunner:
                     opened += 1
 
             long_trigger = anchor * (1.0 - grid_step_pct * (len(pair_state["open_longs"]) + 1))
+            pair_state["next_long_trigger"] = round(float(long_trigger), 5)
             if price <= long_trigger and len(pair_state["open_longs"]) < max_legs:
-                submitted = self._submit_forex_grid_order(broker, pair, "buy", qty, dry_run)
+                submitted = self._submit_grid_order(
+                    broker=broker,
+                    symbol=pair,
+                    side="buy",
+                    quantity=qty,
+                    dry_run=dry_run,
+                    asset_type="forex",
+                )
                 if submitted:
                     pair_state["open_longs"].append({"entry_price": price, "quantity": qty, "opened_at": datetime.now().isoformat()})
                     opened += 1
 
             short_trigger = anchor * (1.0 + grid_step_pct * (len(pair_state["open_shorts"]) + 1))
+            pair_state["next_short_trigger"] = round(float(short_trigger), 5)
             if price >= short_trigger and len(pair_state["open_shorts"]) < max_legs:
-                submitted = self._submit_forex_grid_order(broker, pair, "sell", qty, dry_run)
+                submitted = self._submit_grid_order(
+                    broker=broker,
+                    symbol=pair,
+                    side="sell",
+                    quantity=qty,
+                    dry_run=dry_run,
+                    asset_type="forex",
+                )
                 if submitted:
                     pair_state["open_shorts"].append({"entry_price": price, "quantity": qty, "opened_at": datetime.now().isoformat()})
                     opened += 1
@@ -565,7 +1462,14 @@ class BotRunner:
                 entry = float(leg.get("entry_price", price) or price)
                 leg_qty = int(leg.get("quantity", qty) or qty)
                 if price >= entry * (1.0 + tp_pct):
-                    submitted = self._submit_forex_grid_order(broker, pair, "sell", leg_qty, dry_run)
+                    submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=pair,
+                        side="sell",
+                        quantity=leg_qty,
+                        dry_run=dry_run,
+                        asset_type="forex",
+                    )
                     if submitted:
                         pnl = (price - entry) * leg_qty
                         fees = max(0.5, leg_qty * 0.00002)
@@ -573,7 +1477,18 @@ class BotRunner:
                         realized_total += net
                         pair_state["realized_pnl"] = round(float(pair_state.get("realized_pnl", 0.0) or 0.0) + net, 2)
                         closed += 1
-                        trade_rows.append(self._build_grid_trade_row(pair, "buy", leg_qty, entry, price, net, dry_run))
+                        trade_rows.append(
+                            self._build_grid_trade_row(
+                                symbol=pair,
+                                entry_side="buy",
+                                quantity=leg_qty,
+                                entry_price=entry,
+                                exit_price=price,
+                                net_pnl=net,
+                                dry_run=dry_run,
+                                asset_type="forex",
+                            )
+                        )
                         continue
                 remaining_longs.append(leg)
             pair_state["open_longs"] = remaining_longs
@@ -583,7 +1498,14 @@ class BotRunner:
                 entry = float(leg.get("entry_price", price) or price)
                 leg_qty = int(leg.get("quantity", qty) or qty)
                 if price <= entry * (1.0 - tp_pct):
-                    submitted = self._submit_forex_grid_order(broker, pair, "buy", leg_qty, dry_run)
+                    submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=pair,
+                        side="buy",
+                        quantity=leg_qty,
+                        dry_run=dry_run,
+                        asset_type="forex",
+                    )
                     if submitted:
                         pnl = (entry - price) * leg_qty
                         fees = max(0.5, leg_qty * 0.00002)
@@ -591,7 +1513,18 @@ class BotRunner:
                         realized_total += net
                         pair_state["realized_pnl"] = round(float(pair_state.get("realized_pnl", 0.0) or 0.0) + net, 2)
                         closed += 1
-                        trade_rows.append(self._build_grid_trade_row(pair, "sell", leg_qty, entry, price, net, dry_run))
+                        trade_rows.append(
+                            self._build_grid_trade_row(
+                                symbol=pair,
+                                entry_side="sell",
+                                quantity=leg_qty,
+                                entry_price=entry,
+                                exit_price=price,
+                                net_pnl=net,
+                                dry_run=dry_run,
+                                asset_type="forex",
+                            )
+                        )
                         continue
                 remaining_shorts.append(leg)
             pair_state["open_shorts"] = remaining_shorts
@@ -599,68 +1532,299 @@ class BotRunner:
             if not pair_state["open_longs"] and not pair_state["open_shorts"]:
                 pair_state["anchor"] = price
 
+        for symbol in crypto_symbols:
+            price = self._get_grid_spot_price("crypto", symbol)
+            if price <= 0:
+                continue
+
+            max_symbol_budget = account_total * (max(0.1, crypto_max_position_pct) / 100.0)
+            symbol_exposure_cap = account_total * (max(0.1, crypto_symbol_exposure_pct) / 100.0)
+            effective_leg_budget = min(max(crypto_per_leg_budget, crypto_min_notional), max_symbol_budget)
+            qty = round(max(0.0001, effective_leg_budget / max(price, 1e-9)), 6)
+            qty = min(qty, 3.0)
+            if qty <= 0:
+                continue
+
+            pair_state = pair_states.setdefault(
+                symbol,
+                {
+                    "anchor": price,
+                    "open_longs": [],
+                    "open_shorts": [],
+                    "realized_pnl": 0.0,
+                    "asset_type": "crypto",
+                },
+            )
+
+            anchor = float(pair_state.get("anchor", price) or price)
+            pair_state["last_price"] = round(float(price), 4)
+            pair_state["last_updated"] = datetime.now().isoformat()
+            pair_state["asset_type"] = "crypto"
+            pair_state["exposure_cap"] = round(float(symbol_exposure_cap), 2)
+            current_exposure = _symbol_notional_exposure(pair_state, price)
+            pair_state["exposure_notional"] = current_exposure
+            pair_state["risk_blocked"] = None
+
+            if state.get("crypto_daily_loss_halted", False):
+                pair_state["risk_blocked"] = "daily_loss_limit"
+
+            if not pair_state["open_longs"] and not pair_state["open_shorts"] and not state.get("crypto_daily_loss_halted", False):
+                projected_exposure = current_exposure + (qty * price)
+                if projected_exposure > symbol_exposure_cap + 1e-9:
+                    crypto_open_blocked += 1
+                    pair_state["risk_blocked"] = "exposure_cap"
+                else:
+                    starter_submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=symbol,
+                        side="buy",
+                        quantity=qty,
+                        dry_run=dry_run,
+                        asset_type="crypto",
+                    )
+                    if starter_submitted:
+                        pair_state["open_longs"].append({"entry_price": price, "quantity": qty, "opened_at": datetime.now().isoformat()})
+                        opened += 1
+                        current_exposure = _symbol_notional_exposure(pair_state, price)
+                        pair_state["exposure_notional"] = current_exposure
+
+            long_trigger = anchor * (1.0 - crypto_grid_step_pct * (len(pair_state["open_longs"]) + 1))
+            pair_state["next_long_trigger"] = round(float(long_trigger), 4)
+            if price <= long_trigger and len(pair_state["open_longs"]) < crypto_max_legs and not state.get("crypto_daily_loss_halted", False):
+                projected_exposure = current_exposure + (qty * price)
+                if projected_exposure > symbol_exposure_cap + 1e-9:
+                    crypto_open_blocked += 1
+                    pair_state["risk_blocked"] = "exposure_cap"
+                else:
+                    submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=symbol,
+                        side="buy",
+                        quantity=qty,
+                        dry_run=dry_run,
+                        asset_type="crypto",
+                    )
+                    if submitted:
+                        pair_state["open_longs"].append({"entry_price": price, "quantity": qty, "opened_at": datetime.now().isoformat()})
+                        opened += 1
+                        current_exposure = _symbol_notional_exposure(pair_state, price)
+                        pair_state["exposure_notional"] = current_exposure
+
+            short_trigger = anchor * (1.0 + crypto_grid_step_pct * (len(pair_state["open_shorts"]) + 1))
+            pair_state["next_short_trigger"] = round(float(short_trigger), 4)
+            if price >= short_trigger and len(pair_state["open_shorts"]) < crypto_max_legs and not state.get("crypto_daily_loss_halted", False):
+                projected_exposure = current_exposure + (qty * price)
+                if projected_exposure > symbol_exposure_cap + 1e-9:
+                    crypto_open_blocked += 1
+                    pair_state["risk_blocked"] = "exposure_cap"
+                else:
+                    submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=symbol,
+                        side="sell",
+                        quantity=qty,
+                        dry_run=dry_run,
+                        asset_type="crypto",
+                    )
+                    if submitted:
+                        pair_state["open_shorts"].append({"entry_price": price, "quantity": qty, "opened_at": datetime.now().isoformat()})
+                        opened += 1
+                        current_exposure = _symbol_notional_exposure(pair_state, price)
+                        pair_state["exposure_notional"] = current_exposure
+
+            tp_pct = crypto_grid_step_pct * crypto_take_profit_steps
+
+            remaining_longs = []
+            for leg in pair_state["open_longs"]:
+                entry = float(leg.get("entry_price", price) or price)
+                leg_qty = float(leg.get("quantity", qty) or qty)
+                if price >= entry * (1.0 + tp_pct):
+                    submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=symbol,
+                        side="sell",
+                        quantity=leg_qty,
+                        dry_run=dry_run,
+                        asset_type="crypto",
+                    )
+                    if submitted:
+                        pnl = (price - entry) * leg_qty
+                        fees = max(0.25, (entry + price) * 0.5 * leg_qty * 0.001)
+                        net = round(float(pnl - fees), 2)
+                        realized_total += net
+                        crypto_realized_cycle += net
+                        state["crypto_daily_loss_current"] = round(
+                            float(state.get("crypto_daily_loss_current", 0.0) or 0.0) + net,
+                            2,
+                        )
+                        pair_state["realized_pnl"] = round(float(pair_state.get("realized_pnl", 0.0) or 0.0) + net, 2)
+                        closed += 1
+                        trade_rows.append(
+                            self._build_grid_trade_row(
+                                symbol=symbol,
+                                entry_side="buy",
+                                quantity=leg_qty,
+                                entry_price=entry,
+                                exit_price=price,
+                                net_pnl=net,
+                                dry_run=dry_run,
+                                asset_type="crypto",
+                            )
+                        )
+                        continue
+                remaining_longs.append(leg)
+            pair_state["open_longs"] = remaining_longs
+
+            remaining_shorts = []
+            for leg in pair_state["open_shorts"]:
+                entry = float(leg.get("entry_price", price) or price)
+                leg_qty = float(leg.get("quantity", qty) or qty)
+                if price <= entry * (1.0 - tp_pct):
+                    submitted = self._submit_grid_order(
+                        broker=broker,
+                        symbol=symbol,
+                        side="buy",
+                        quantity=leg_qty,
+                        dry_run=dry_run,
+                        asset_type="crypto",
+                    )
+                    if submitted:
+                        pnl = (entry - price) * leg_qty
+                        fees = max(0.25, (entry + price) * 0.5 * leg_qty * 0.001)
+                        net = round(float(pnl - fees), 2)
+                        realized_total += net
+                        crypto_realized_cycle += net
+                        state["crypto_daily_loss_current"] = round(
+                            float(state.get("crypto_daily_loss_current", 0.0) or 0.0) + net,
+                            2,
+                        )
+                        pair_state["realized_pnl"] = round(float(pair_state.get("realized_pnl", 0.0) or 0.0) + net, 2)
+                        closed += 1
+                        trade_rows.append(
+                            self._build_grid_trade_row(
+                                symbol=symbol,
+                                entry_side="sell",
+                                quantity=leg_qty,
+                                entry_price=entry,
+                                exit_price=price,
+                                net_pnl=net,
+                                dry_run=dry_run,
+                                asset_type="crypto",
+                            )
+                        )
+                        continue
+                remaining_shorts.append(leg)
+            pair_state["open_shorts"] = remaining_shorts
+            pair_state["exposure_notional"] = _symbol_notional_exposure(pair_state, price)
+
+            if not pair_state["open_longs"] and not pair_state["open_shorts"]:
+                pair_state["anchor"] = price
+
         grid_state["last_cycle"] = datetime.now().isoformat()
+
+        if float(state.get("crypto_daily_loss_current", 0.0) or 0.0) <= -float(crypto_daily_loss_limit):
+            state["crypto_daily_loss_halted"] = True
+
+        if state.get("crypto_daily_loss_halted", False) and not crypto_halted_before:
+            append_bot_log(
+                "Crypto entry circuit breaker triggered",
+                level="warning",
+                details={
+                    "daily_loss_current": state.get("crypto_daily_loss_current", 0.0),
+                    "daily_loss_limit": round(float(crypto_daily_loss_limit), 2),
+                },
+            )
 
         summary = {
             "pairs_processed": len(pairs),
+            "crypto_symbols_processed": len(crypto_symbols),
             "opened": opened,
             "closed": closed,
             "realized_pnl": round(realized_total, 2),
+            "crypto_realized_pnl": round(float(crypto_realized_cycle), 2),
             "grid_step_pct": round(grid_step_pct * 100, 3),
             "max_legs_per_pair": max_legs,
             "grid_capital": round(grid_capital, 2),
+            "crypto_enabled": bool(crypto_symbols),
+            "crypto_open_blocked": int(crypto_open_blocked),
+            "crypto_daily_loss_current": round(float(state.get("crypto_daily_loss_current", 0.0) or 0.0), 2),
+            "crypto_daily_loss_limit": round(float(crypto_daily_loss_limit), 2),
+            "crypto_daily_loss_halted": bool(state.get("crypto_daily_loss_halted", False)),
         }
         return summary, trade_rows
 
-    def _submit_forex_grid_order(self, broker, pair: str, side: str, quantity: int, dry_run: bool) -> bool:
+    def _submit_grid_order(
+        self,
+        broker,
+        symbol: str,
+        side: str,
+        quantity: float,
+        dry_run: bool,
+        asset_type: str,
+    ) -> bool:
         if dry_run:
             return True
         if broker is None:
             return False
         if state.get("broker_name") != "ibkr":
             return False
-        if not hasattr(broker, "place_forex_order"):
+
+        method_name = "place_forex_order" if asset_type == "forex" else "place_crypto_order"
+        if not hasattr(broker, method_name):
             return False
 
         try:
-            order = run_async(broker.place_forex_order(pair=pair, side=side, quantity=quantity))
+            if asset_type == "forex":
+                order = run_async(broker.place_forex_order(pair=symbol, side=side, quantity=int(quantity)))
+            else:
+                order = run_async(broker.place_crypto_order(symbol=symbol, side=side, quantity=float(quantity)))
             return bool(order and getattr(order, "status", "") != "failed")
         except Exception:
             return False
 
     def _build_grid_trade_row(
         self,
-        pair: str,
+        symbol: str,
         entry_side: str,
-        quantity: int,
+        quantity: float,
         entry_price: float,
         exit_price: float,
         net_pnl: float,
         dry_run: bool,
+        asset_type: str,
     ) -> Dict[str, Any]:
+        quantity_value: Any = int(quantity) if asset_type == "forex" else round(float(quantity), 6)
+        fee_estimate = max(0.5, float(quantity) * 0.00002)
+        if asset_type == "crypto":
+            fee_estimate = max(0.25, ((float(entry_price) + float(exit_price)) * 0.5 * float(quantity) * 0.001))
+
         return {
             "trade_id": f"GRID-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
             "timestamp": datetime.now().isoformat(),
-            "strategy": "forex_grid",
-            "asset_type": "forex",
-            "symbol": pair,
-            "underlying": pair,
+            "strategy": "forex_grid" if asset_type == "forex" else "crypto_grid",
+            "asset_type": asset_type,
+            "symbol": symbol,
+            "underlying": symbol,
             "side": entry_side,
-            "quantity": quantity,
+            "quantity": quantity_value,
             "entry_price": round(float(entry_price), 5),
             "exit_price": round(float(exit_price), 5),
-            "fees": round(max(0.5, quantity * 0.00002), 2),
+            "fees": round(float(fee_estimate), 2),
             "gross_pnl": round(float(net_pnl), 2),
             "net_pnl": round(float(net_pnl), 2),
             "status": "closed",
             "order_submitted": not dry_run,
             "execution_origin": "simulated" if dry_run else "live_paper",
             "is_simulated": bool(dry_run),
-            "notes": "Aggressive mode forex grid close",
+            "notes": "Forex grid leg close" if asset_type == "forex" else "Crypto grid leg close",
         }
 
-    def _get_fx_spot_price(self, pair: str) -> float:
-        ticker = f"{pair}=X"
+    def _get_grid_spot_price(self, asset_type: str, symbol: str) -> float:
+        normalized = str(symbol or "").upper().strip()
+        if not normalized:
+            return 0.0
+
+        ticker = f"{normalized}=X" if asset_type == "forex" else normalized
         try:
             hist = yf.Ticker(ticker).history(period="5d", interval="5m")
             if hist is not None and not hist.empty and "Close" in hist.columns:
@@ -669,14 +1833,24 @@ class BotRunner:
                     return float(closes.iloc[-1])
         except Exception:
             pass
-        fallback = {
+
+        if asset_type == "crypto":
+            crypto_fallback = {
+                "BTC-USD": 65000.0,
+                "ETH-USD": 3200.0,
+                "SOL-USD": 145.0,
+                "BNB-USD": 540.0,
+            }
+            return float(crypto_fallback.get(normalized, 100.0))
+
+        forex_fallback = {
             "EURUSD": 1.08,
             "GBPUSD": 1.27,
             "USDJPY": 149.5,
             "AUDUSD": 0.66,
             "NZDUSD": 0.60,
         }
-        return float(fallback.get(pair, 1.0))
+        return float(forex_fallback.get(normalized, 1.0))
 
 
 bot_runner = BotRunner()
@@ -1114,6 +2288,29 @@ def initialize():
             state["broker_name"] = "demo"
             state["broker_runtime_config"] = {}
             state["broker_init_error"] = str(e)
+
+    # Auto-start bot runner so forex grid can run continuously once backend is up.
+    if state.get("broker_init_attempted", False) and not state.get("bot_auto_started", False):
+        state["bot_auto_started"] = True
+        try:
+            auto_start_enabled = os.getenv("AUTO_START_BOT", "true").strip().lower() not in {"0", "false", "no"}
+            if auto_start_enabled and state.get("broker") is not None and not bot_runner.is_running():
+                interval = int(os.getenv("BOT_INTERVAL_SECONDS", "60"))
+                state["execution_mode"] = "automatic"
+                # Run live-paper by default when auto-starting with connected broker.
+                state["bot_dry_run"] = False
+                bot_runner.start(interval_seconds=max(10, interval))
+                append_bot_log(
+                    "Bot auto-started",
+                    level="warning",
+                    details={
+                        "execution_mode": state.get("execution_mode"),
+                        "dry_run": state.get("bot_dry_run"),
+                        "interval_seconds": max(10, interval),
+                    },
+                )
+        except Exception as e:
+            logger.error(f"Auto-start bot initialization failed: {e}")
     "SNPS", "SQ", "RBLX", "DDOG", "ZS", "TTD", "WDAY",
 
 
@@ -1214,6 +2411,277 @@ def get_portfolio_history():
         return jsonify({"history": history}), 200
     except Exception as e:
         logger.error(f"Error getting portfolio history: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/watchlists", methods=["GET"])
+def get_watchlists():
+    """Get all watchlists grouped by category."""
+    try:
+        rows = [_decorate_watchlist(row) for row in list(state.get("watchlists", []))]
+        categories = sorted({str(row.get("category", "General") or "General") for row in rows})
+        return jsonify({"watchlists": rows, "categories": categories}), 200
+    except Exception as e:
+        logger.error(f"Error getting watchlists: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/watchlists", methods=["POST"])
+def create_watchlist():
+    """Create a new watchlist."""
+    try:
+        data = request.json or {}
+        name = str(data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "Watchlist name is required"}), 400
+
+        category = str(data.get("category") or "General").strip() or "General"
+        symbols = data.get("symbols") or []
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(",")]
+        watchlist = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "category": category,
+            "symbols": sorted({sym for sym in (_normalize_symbol_text(s) for s in symbols) if sym}),
+            "notes": str(data.get("notes") or "").strip(),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+
+        with WATCHLISTS_LOCK:
+            rows = list(state.get("watchlists", []))
+            rows.append(watchlist)
+            state["watchlists"] = rows
+            _save_watchlists(rows)
+
+        return jsonify({"watchlist": _decorate_watchlist(watchlist)}), 201
+    except Exception as e:
+        logger.error(f"Error creating watchlist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/watchlists/<watchlist_id>", methods=["PUT"])
+def update_watchlist(watchlist_id: str):
+    """Update an existing watchlist."""
+    try:
+        data = request.json or {}
+        with WATCHLISTS_LOCK:
+            rows = list(state.get("watchlists", []))
+            watchlist = _find_row_by_id(rows, watchlist_id)
+            if watchlist is None:
+                return jsonify({"error": "Watchlist not found"}), 404
+
+            if "name" in data:
+                watchlist["name"] = str(data.get("name") or "").strip() or watchlist.get("name", "Watchlist")
+            if "category" in data:
+                watchlist["category"] = str(data.get("category") or "General").strip() or "General"
+            if "notes" in data:
+                watchlist["notes"] = str(data.get("notes") or "").strip()
+            if "symbols" in data:
+                symbols = data.get("symbols") or []
+                if isinstance(symbols, str):
+                    symbols = [s.strip() for s in symbols.split(",")]
+                watchlist["symbols"] = sorted({sym for sym in (_normalize_symbol_text(s) for s in symbols) if sym})
+
+            watchlist["updated_at"] = _now_iso()
+            state["watchlists"] = rows
+            _save_watchlists(rows)
+
+        return jsonify({"watchlist": _decorate_watchlist(watchlist)}), 200
+    except Exception as e:
+        logger.error(f"Error updating watchlist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/watchlists/<watchlist_id>", methods=["DELETE"])
+def delete_watchlist(watchlist_id: str):
+    """Delete a watchlist."""
+    try:
+        with WATCHLISTS_LOCK:
+            rows = list(state.get("watchlists", []))
+            next_rows = [row for row in rows if str(row.get("id")) != str(watchlist_id)]
+            if len(next_rows) == len(rows):
+                return jsonify({"error": "Watchlist not found"}), 404
+            state["watchlists"] = next_rows
+            _save_watchlists(next_rows)
+
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        logger.error(f"Error deleting watchlist: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sim-portfolios", methods=["GET"])
+def get_sim_portfolios():
+    """Get simulated portfolios with live mark-to-market values."""
+    try:
+        rows = [_decorate_portfolio(row) for row in list(state.get("simulated_portfolios", []))]
+        return jsonify({"portfolios": rows, "account_total_value": round(_current_account_total_value(), 2)}), 200
+    except Exception as e:
+        logger.error(f"Error getting simulated portfolios: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sim-portfolios", methods=["POST"])
+def create_sim_portfolio():
+    """Create a new simulated portfolio seeded with current account value by default."""
+    try:
+        data = request.json or {}
+        name = str(data.get("name") or "").strip() or f"Sandbox {len(state.get('simulated_portfolios', [])) + 1}"
+        clone_current = bool(data.get("clone_current_account", True))
+        initial_cash_raw = data.get("initial_cash")
+        initial_cash = float(initial_cash_raw) if initial_cash_raw not in (None, "") else 0.0
+
+        if initial_cash <= 0 and clone_current:
+            initial_cash = _current_account_total_value()
+        if initial_cash <= 0:
+            initial_cash = 100000.0
+
+        portfolio = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "cash": round(initial_cash, 2),
+            "starting_cash": round(initial_cash, 2),
+            "holdings": [],
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+
+        with SIM_PORTFOLIOS_LOCK:
+            rows = list(state.get("simulated_portfolios", []))
+            rows.append(portfolio)
+            state["simulated_portfolios"] = rows
+            _save_simulated_portfolios(rows)
+
+        return jsonify({"portfolio": _decorate_portfolio(portfolio)}), 201
+    except Exception as e:
+        logger.error(f"Error creating simulated portfolio: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sim-portfolios/<portfolio_id>", methods=["DELETE"])
+def delete_sim_portfolio(portfolio_id: str):
+    """Delete a simulated portfolio."""
+    try:
+        with SIM_PORTFOLIOS_LOCK:
+            rows = list(state.get("simulated_portfolios", []))
+            next_rows = [row for row in rows if str(row.get("id")) != str(portfolio_id)]
+            if len(next_rows) == len(rows):
+                return jsonify({"error": "Portfolio not found"}), 404
+            state["simulated_portfolios"] = next_rows
+            _save_simulated_portfolios(next_rows)
+
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        logger.error(f"Error deleting simulated portfolio: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sim-portfolios/<portfolio_id>/holdings", methods=["POST"])
+def add_sim_portfolio_holding(portfolio_id: str):
+    """Add a holding lot to a simulated portfolio."""
+    try:
+        data = request.json or {}
+        symbol = _normalize_symbol_text(data.get("symbol"))
+        if not symbol:
+            return jsonify({"error": "Symbol is required"}), 400
+
+        shares_raw = data.get("shares", 0)
+        shares = float(shares_raw or 0)
+        if shares <= 0:
+            return jsonify({"error": "Shares must be greater than zero"}), 400
+
+        buy_date = _parse_iso_date(data.get("buy_date"))
+        buy_price_raw = data.get("buy_price")
+        price_source = "user_input"
+        if buy_price_raw in (None, ""):
+            buy_price = _get_latest_market_price(symbol)
+            price_source = "current_market"
+        else:
+            buy_price = float(buy_price_raw)
+
+        if buy_price <= 0:
+            return jsonify({"error": f"Unable to resolve a valid price for {symbol}"}), 400
+
+        with SIM_PORTFOLIOS_LOCK:
+            rows = list(state.get("simulated_portfolios", []))
+            portfolio = _find_row_by_id(rows, portfolio_id)
+            if portfolio is None:
+                return jsonify({"error": "Portfolio not found"}), 404
+
+            cost = round(shares * buy_price, 2)
+            cash = float(portfolio.get("cash", 0) or 0)
+            if cost > cash + 1e-9:
+                return jsonify({"error": f"Insufficient cash for {symbol}. Need {cost:.2f}, have {cash:.2f}"}), 400
+
+            holding = {
+                "id": str(uuid.uuid4()),
+                "symbol": symbol,
+                "shares": shares,
+                "buy_price": round(buy_price, 2),
+                "buy_date": buy_date,
+                "created_at": _now_iso(),
+                "price_source": price_source,
+            }
+            portfolio.setdefault("holdings", []).append(holding)
+            portfolio["cash"] = round(cash - cost, 2)
+            portfolio["updated_at"] = _now_iso()
+            state["simulated_portfolios"] = rows
+            _save_simulated_portfolios(rows)
+
+        return jsonify({"portfolio": _decorate_portfolio(portfolio), "holding": holding}), 201
+    except Exception as e:
+        logger.error(f"Error adding simulated holding: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sim-portfolios/<portfolio_id>/holdings/<holding_id>", methods=["DELETE"])
+def remove_sim_portfolio_holding(portfolio_id: str, holding_id: str):
+    """Sell/remove a holding lot from a simulated portfolio at the current market price."""
+    try:
+        with SIM_PORTFOLIOS_LOCK:
+            rows = list(state.get("simulated_portfolios", []))
+            portfolio = _find_row_by_id(rows, portfolio_id)
+            if portfolio is None:
+                return jsonify({"error": "Portfolio not found"}), 404
+
+            holdings = list(portfolio.get("holdings", []) or [])
+            holding = _find_row_by_id(holdings, holding_id)
+            if holding is None:
+                return jsonify({"error": "Holding not found"}), 404
+
+            symbol = _normalize_symbol_text(holding.get("symbol"))
+            shares = float(holding.get("shares", 0) or 0)
+            buy_price = float(holding.get("buy_price", 0) or 0)
+            current_price = _get_latest_market_price(symbol)
+            if current_price <= 0:
+                current_price = buy_price
+
+            sale_value = round(shares * current_price, 2)
+            cost_basis = round(shares * buy_price, 2)
+            realized_pnl = round(sale_value - cost_basis, 2)
+
+            portfolio["cash"] = round(float(portfolio.get("cash", 0) or 0) + sale_value, 2)
+            portfolio["holdings"] = [row for row in holdings if str(row.get("id")) != str(holding_id)]
+            portfolio["updated_at"] = _now_iso()
+            state["simulated_portfolios"] = rows
+            _save_simulated_portfolios(rows)
+
+        return jsonify(
+            {
+                "portfolio": _decorate_portfolio(portfolio),
+                "sold": {
+                    "holding_id": holding_id,
+                    "symbol": symbol,
+                    "shares": shares,
+                    "sale_price": round(current_price, 4),
+                    "realized_pnl": realized_pnl,
+                },
+            }
+        ), 200
+    except Exception as e:
+        logger.error(f"Error removing simulated holding: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1621,32 +3089,30 @@ def get_trade_logs():
         asset_type = request.args.get("asset_type", "all", type=str).lower()
         status = request.args.get("status", "all", type=str).lower()
 
-        source = "demo"
+        source = "bot_ledger"
         broker = state.get("broker")
         logs = []
-        simulated_logs = list(state.get("simulated_trade_logs", []))
 
         if broker is not None and hasattr(broker, "get_trade_logs"):
             logs = run_async(broker.get_trade_logs(days=days, asset_type=asset_type, status=status)) or []
             source = state.get("broker_name", "live")
-        elif broker is None:
-            mock_gen = MockPortfolioGenerator()
-            logs = mock_gen.generate_trade_logs(days=days)
-            source = "demo"
 
-            if asset_type != "all":
-                logs = [row for row in logs if str(row.get("asset_type", "")).lower() == asset_type]
+        # Fallback to local bot ledger when broker logs are unavailable or empty.
+        if not logs:
+            logs = _load_persisted_trade_logs()
+            source = "bot_ledger"
 
-            if status != "all":
-                logs = [row for row in logs if str(row.get("status", "")).lower() == status]
-        else:
-            # Connected broker without trade-log support: return empty live set.
-            logs = []
-            source = f"{state.get('broker_name', 'live')}_unsupported"
+        # Remove testing utilities from production ledger view.
+        logs = [
+            row for row in logs
+            if str(row.get("strategy", "")).lower() not in {"try_buy_sell", "try_buy_sell_live"}
+        ]
 
-        # Merge one-click simulated records for demo/testing visibility.
-        if simulated_logs:
-            logs.extend(simulated_logs)
+        if asset_type != "all":
+            logs = [row for row in logs if str(row.get("asset_type", "")).lower() == asset_type]
+
+        if status != "all":
+            logs = [row for row in logs if str(row.get("status", "")).lower() == status]
 
         # Newest first
         logs.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -1753,13 +3219,49 @@ def get_bot_status():
 
     grid_state = state.get("forex_grid_state") or {}
     pairs = grid_state.get("pairs") or {}
-    open_longs = 0
-    open_shorts = 0
-    realized_pnl = 0.0
-    for _, pair_state in pairs.items():
-        open_longs += len(pair_state.get("open_longs", []) or [])
-        open_shorts += len(pair_state.get("open_shorts", []) or [])
-        realized_pnl += float(pair_state.get("realized_pnl", 0.0) or 0.0)
+    forex_open_longs = 0
+    forex_open_shorts = 0
+    forex_realized_pnl = 0.0
+    forex_pair_details = []
+
+    crypto_open_longs = 0
+    crypto_open_shorts = 0
+    crypto_realized_pnl = 0.0
+    crypto_symbol_details = []
+
+    for pair_symbol, pair_state in sorted(pairs.items()):
+        asset_type = str(pair_state.get("asset_type", "forex") or "forex").lower()
+        open_longs_count = len(pair_state.get("open_longs", []) or [])
+        open_shorts_count = len(pair_state.get("open_shorts", []) or [])
+        realized_value = round(float(pair_state.get("realized_pnl", 0.0) or 0.0), 2)
+
+        base_row = {
+            "pair": pair_symbol,
+            "symbol": pair_symbol,
+            "asset_type": asset_type,
+            "anchor": pair_state.get("anchor"),
+            "last_price": pair_state.get("last_price"),
+            "open_longs": open_longs_count,
+            "open_shorts": open_shorts_count,
+            "realized_pnl": realized_value,
+            "next_long_trigger": pair_state.get("next_long_trigger"),
+            "next_short_trigger": pair_state.get("next_short_trigger"),
+            "last_updated": pair_state.get("last_updated"),
+            "exposure_notional": pair_state.get("exposure_notional"),
+            "exposure_cap": pair_state.get("exposure_cap"),
+            "risk_blocked": pair_state.get("risk_blocked"),
+        }
+
+        if asset_type == "crypto":
+            crypto_open_longs += open_longs_count
+            crypto_open_shorts += open_shorts_count
+            crypto_realized_pnl += realized_value
+            crypto_symbol_details.append(base_row)
+        else:
+            forex_open_longs += open_longs_count
+            forex_open_shorts += open_shorts_count
+            forex_realized_pnl += realized_value
+            forex_pair_details.append(base_row)
 
     return jsonify({
         "execution_mode": state["execution_mode"],
@@ -1771,13 +3273,31 @@ def get_bot_status():
         "dry_run": state["bot_dry_run"],
         "backend_time": datetime.now().isoformat(),
         "last_actions": state.get("portfolio_data", {}).get("last_actions", []),
+        "strategy_audit": state.get("strategy_audit", {}),
         "forex_grid": {
-            "pairs_configured": len(pairs),
-            "open_longs": open_longs,
-            "open_shorts": open_shorts,
-            "open_total": open_longs + open_shorts,
-            "realized_pnl": round(realized_pnl, 2),
+            "pairs_configured": len(forex_pair_details),
+            "open_longs": forex_open_longs,
+            "open_shorts": forex_open_shorts,
+            "open_total": forex_open_longs + forex_open_shorts,
+            "realized_pnl": round(forex_realized_pnl, 2),
             "last_cycle": grid_state.get("last_cycle"),
+            "last_tick": state.get("forex_last_tick"),
+            "tick_seconds": int(state.get("forex_tick_seconds", 1) or 1),
+            "full_cycle_seconds": int(state.get("bot_interval_seconds", 60) or 60),
+            "pairs": forex_pair_details,
+        },
+        "crypto_grid": {
+            "symbols_configured": len(crypto_symbol_details),
+            "open_longs": crypto_open_longs,
+            "open_shorts": crypto_open_shorts,
+            "open_total": crypto_open_longs + crypto_open_shorts,
+            "realized_pnl": round(crypto_realized_pnl, 2),
+            "last_cycle": grid_state.get("last_cycle"),
+            "last_tick": state.get("forex_last_tick"),
+            "daily_loss_current": round(float(state.get("crypto_daily_loss_current", 0.0) or 0.0), 2),
+            "daily_loss_limit": round(float(state.get("crypto_daily_loss_limit", 750.0) or 750.0), 2),
+            "daily_loss_halted": bool(state.get("crypto_daily_loss_halted", False)),
+            "symbols": crypto_symbol_details,
         },
     }), 200
 
@@ -1933,6 +3453,52 @@ def get_broker_status():
         return jsonify({"error": str(e)}), 500
 
 
+def _build_broker_capabilities() -> dict[str, Any]:
+    broker = state.get("broker")
+    broker_name = str(state.get("broker_name", "demo") or "demo")
+    connected = bool(broker is not None)
+    paper_trading = bool(getattr(broker, "paper_trading", False)) if broker is not None else True
+
+    supports_equities = bool(connected and hasattr(broker, "place_order"))
+    supports_forex = bool(connected and hasattr(broker, "place_forex_order"))
+    supports_crypto = bool(connected and hasattr(broker, "place_crypto_order"))
+    supports_options = bool(connected and hasattr(broker, "sell_covered_call"))
+
+    if not connected:
+        crypto_reason = "No live broker connected"
+    elif broker_name != "ibkr":
+        crypto_reason = f"{broker_name.upper()} broker adapter has no crypto order path yet"
+    elif supports_crypto:
+        crypto_reason = "IBKR crypto routing available (PAXOS), subject to account permissions"
+    else:
+        crypto_reason = "Connected broker does not expose crypto order API"
+
+    return {
+        "broker": broker_name,
+        "connected": connected,
+        "paper_trading": paper_trading,
+        "supports": {
+            "equities": supports_equities,
+            "forex": supports_forex,
+            "crypto": supports_crypto,
+            "covered_calls": supports_options,
+        },
+        "crypto": {
+            "supported": supports_crypto,
+            "reason": crypto_reason,
+        },
+    }
+
+
+@app.route("/api/broker/capabilities", methods=["GET"])
+def get_broker_capabilities():
+    """Get capability flags for current broker and execution adapter."""
+    try:
+        return jsonify(_build_broker_capabilities()), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/broker/options", methods=["GET"])
 def get_broker_options():
     """Get current broker and supported broker types."""
@@ -1941,6 +3507,7 @@ def get_broker_options():
             "current": state["broker_name"],
             "connected": state["broker"] is not None,
             "active_config": state.get("broker_runtime_config", {}),
+            "capabilities": _build_broker_capabilities(),
             "available": ["ibkr", "alpaca", "demo"],
             "defaults": {
                 "ibkr": {
@@ -2287,89 +3854,6 @@ def get_strategy_defaults():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/backtest/<symbol>/<strategy>", methods=["GET"])
-def run_backtest(symbol, strategy):
-    """Run historical backtest on a symbol/strategy combo."""
-    try:
-        from backtest import BacktestEngine
-        import numpy as np
-        
-        symbol = str(symbol).upper().strip()
-        strategy = str(strategy).lower().strip()
-        lookback_days = request.args.get("lookback_days", 252, type=int)
-        
-        engine = BacktestEngine(symbol, lookback_days=lookback_days)
-        
-        if strategy == "blowup_stocks":
-            result = engine.backtest_blowup_stocks()
-        elif strategy == "covered_calls":
-            result = engine.backtest_covered_calls()
-        else:
-            return jsonify({"error": f"Unknown strategy: {strategy}"}), 400
-        
-        if not result:
-            return jsonify({"error": f"Backtest failed for {symbol}"}), 500
-
-        diagnostics = None
-        if result.total_trades == 0:
-            diagnostics = {
-                "status": "no_trades",
-                "message": f"No completed trades were generated for {symbol} under current {strategy} rules.",
-                "suggestions": [
-                    "Try a different symbol with more recent momentum shifts.",
-                    "Increase lookback days to 400-600 to capture more setups.",
-                    "For blowup stocks, consider names with frequent volume spikes.",
-                ],
-            }
-
-            try:
-                hist_data = engine.fetch_historical_data(
-                    datetime.now() - timedelta(days=lookback_days),
-                    datetime.now(),
-                )
-                closes = hist_data.get("closes") if hist_data else None
-                volumes = hist_data.get("volumes") if hist_data else None
-                if closes is not None and volumes is not None and len(closes) >= 30 and len(volumes) >= 30:
-                    volume_ma_20 = np.convolve(volumes, np.ones(20) / 20, mode="valid")
-                    strict_signals = 0
-                    relaxed_signals = 0
-                    for i in range(20, len(closes)):
-                        ratio = volumes[i] / max(1e-9, volume_ma_20[i - 20])
-                        up_day = closes[i] > closes[i - 1]
-                        if ratio > 2.0 and up_day:
-                            strict_signals += 1
-                        if ratio > 1.5 and up_day:
-                            relaxed_signals += 1
-
-                    diagnostics["signal_scan"] = {
-                        "strict_signals": int(strict_signals),
-                        "relaxed_signals": int(relaxed_signals),
-                        "bars_evaluated": int(len(closes)),
-                    }
-            except Exception:
-                pass
-        
-        return jsonify({
-            "symbol": symbol,
-            "strategy": strategy,
-            "result": {
-                "total_trades": result.total_trades,
-                "winning_trades": result.winning_trades,
-                "losing_trades": result.losing_trades,
-                "win_rate": result.win_rate,
-                "avg_win": result.avg_win,
-                "avg_loss": result.avg_loss,
-                "sharpe_ratio": result.sharpe_ratio,
-                "max_drawdown": result.max_drawdown,
-                "total_return": result.total_return,
-            },
-            "diagnostics": diagnostics,
-        }), 200
-    except Exception as e:
-        logger.error(f"Error running backtest: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/signal/metadata", methods=["POST"])
 def create_signal_with_metadata():
     """Create a trading signal with confidence, data sources, and recommendation horizon."""
@@ -2442,6 +3926,89 @@ def get_market_regime():
             "vix": None,
             "error": str(e),
         }), 200
+
+
+@app.route("/api/market/indices", methods=["GET"])
+def get_market_indices():
+    """Get major index snapshots with intraday chart points for homepage overview."""
+    try:
+        now = datetime.now()
+        index_specs = [
+            {"symbol": "^GSPC", "name": "S&P 500", "region": "US"},
+            {"symbol": "^IXIC", "name": "NASDAQ", "region": "US"},
+            {"symbol": "^DJI", "name": "Dow Jones", "region": "US"},
+            {"symbol": "^HSI", "name": "Hang Seng", "region": "HK"},
+            {"symbol": "^N225", "name": "Nikkei 225", "region": "JP"},
+        ]
+
+        def _to_float(v: Any, default: float = 0.0) -> float:
+            try:
+                out = float(v)
+                return out if out == out else default
+            except Exception:
+                return default
+
+        rows = []
+        for spec in index_specs:
+            ticker = yf.Ticker(spec["symbol"])
+            intraday = ticker.history(period="1d", interval="5m")
+
+            use_hist = intraday
+            if use_hist is None or use_hist.empty or "Close" not in use_hist.columns:
+                # Fallback for weekends/holidays or unavailable intraday endpoints.
+                use_hist = ticker.history(period="5d", interval="1d")
+
+            points = []
+            closes = []
+            if use_hist is not None and not use_hist.empty and "Close" in use_hist.columns:
+                for idx, price in use_hist["Close"].dropna().items():
+                    px = _to_float(price, 0.0)
+                    if px <= 0:
+                        continue
+                    closes.append(px)
+                    try:
+                        ts = idx.to_pydatetime().isoformat() if hasattr(idx, "to_pydatetime") else str(idx)
+                    except Exception:
+                        ts = str(idx)
+                    points.append({"time": ts, "price": round(px, 4)})
+
+            if not closes:
+                continue
+
+            latest = closes[-1]
+            previous_close = closes[-2] if len(closes) > 1 else closes[-1]
+
+            try:
+                fast_info = getattr(ticker, "fast_info", None)
+                if fast_info is not None:
+                    prev_candidate = fast_info.get("previousClose") if hasattr(fast_info, "get") else None
+                    if prev_candidate is not None:
+                        previous_close = _to_float(prev_candidate, previous_close)
+            except Exception:
+                pass
+
+            delta = latest - previous_close
+            delta_pct = (delta / previous_close * 100.0) if previous_close else 0.0
+
+            rows.append(
+                {
+                    "symbol": spec["symbol"],
+                    "name": spec["name"],
+                    "region": spec["region"],
+                    "price": round(latest, 4),
+                    "previous_close": round(previous_close, 4),
+                    "change": round(delta, 4),
+                    "change_pct": round(delta_pct, 3),
+                    "trend": "up" if delta >= 0 else "down",
+                    "points": points,
+                    "point_count": len(points),
+                }
+            )
+
+        return jsonify({"indices": rows, "as_of": now.isoformat()}), 200
+    except Exception as e:
+        logger.error(f"Error getting market indices: {e}")
+        return jsonify({"indices": [], "as_of": datetime.now().isoformat(), "error": str(e)}), 200
 
 
 @app.route("/api/positions/risks", methods=["GET"])
@@ -2613,6 +4180,177 @@ def get_performance_by_regime():
         }), 200
     except Exception as e:
         logger.error(f"Error getting regime performance: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================================
+# Trade History & Performance Endpoints
+# ============================================================================
+
+@app.route("/api/trades/history", methods=["GET"])
+def get_trades_history():
+    """Get complete trade history with optional filtering."""
+    try:
+        limit = request.args.get("limit", 100, type=int)
+        strategy = request.args.get("strategy", None, type=str)
+        symbol = request.args.get("symbol", None, type=str)
+        
+        trades = _load_persisted_trade_logs()
+        
+        # Filter by strategy
+        if strategy and strategy != "all":
+            trades = [t for t in trades if t.get("strategy", "").lower() == strategy.lower()]
+        
+        # Filter by symbol
+        if symbol and symbol != "all":
+            trades = [t for t in trades if _normalize_symbol_text(t.get("symbol", "")) == _normalize_symbol_text(symbol)]
+        
+        # Sort by timestamp descending (newest first)
+        trades.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        
+        # Limit results
+        trades = trades[:limit]
+        
+        return jsonify({
+            "trades": trades,
+            "count": len(trades),
+            "total_available": len(_load_persisted_trade_logs()),
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting trade history: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trades/log", methods=["POST"])
+def log_new_trade():
+    """Log a new trade execution."""
+    try:
+        data = request.json or {}
+        
+        symbol = data.get("symbol", "")
+        entry_price = float(data.get("entry_price", 0))
+        exit_price = float(data.get("exit_price", 0))
+        quantity = int(data.get("quantity", 0))
+        strategy = data.get("strategy", "unknown")
+        entry_reason = data.get("entry_reason", "")
+        mode = data.get("mode", "simulated")
+        
+        if not symbol or entry_price <= 0 or exit_price <= 0 or quantity <= 0:
+            return jsonify({"error": "Invalid trade data"}), 400
+        
+        trade = _log_trade(
+            symbol=symbol,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            strategy=strategy,
+            entry_reason=entry_reason,
+            mode=mode,
+            broker=state.get("broker_name", "demo"),
+        )
+        
+        return jsonify({
+            "success": True,
+            "trade": trade,
+        }), 201
+    except Exception as e:
+        logger.error(f"Error logging trade: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trades/metrics", methods=["GET"])
+def get_trades_metrics():
+    """Get overall trading metrics (win rate, P&L, Sharpe ratio, etc.)."""
+    try:
+        trades = _load_persisted_trade_logs()
+        metrics = _get_trade_metrics(trades)
+        
+        return jsonify({
+            "metrics": metrics,
+            "as_of": datetime.now().isoformat(),
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting trade metrics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trades/metrics/by-strategy", methods=["GET"])
+def get_trades_metrics_by_strategy():
+    """Get trading metrics grouped by strategy."""
+    try:
+        trades = _load_persisted_trade_logs()
+        by_strategy = _get_performance_by_strategy(trades)
+        
+        return jsonify({
+            "strategies": by_strategy,
+            "as_of": datetime.now().isoformat(),
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting strategy metrics: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/trades/daily-pnl", methods=["GET"])
+def get_daily_pnl():
+    """Get daily P&L summary."""
+    try:
+        trades = _load_persisted_trade_logs()
+        daily = _get_daily_pnl(trades)
+        
+        return jsonify({
+            "daily": daily,
+            "as_of": datetime.now().isoformat(),
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting daily PNL: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/backtest", methods=["POST"])
+def run_backtest():
+    """Run backtesting on a strategy."""
+    try:
+        data = request.json or {}
+        symbol = data.get("symbol", "AAPL").upper()
+        strategy_raw = str(data.get("strategy", "momentum") or "momentum").lower().strip()
+        strategy_aliases = {
+            "blowup_stocks": "momentum",
+            "covered_calls": "swing",
+            "forex": "mean_reversion",
+            "value": "mean_reversion",
+        }
+        strategy = strategy_aliases.get(strategy_raw, strategy_raw)
+        days_lookback = int(data.get("days_lookback", 60))
+        initial_capital = float(data.get("initial_capital", 10000))
+        
+        if strategy not in ["momentum", "swing", "mean_reversion"]:
+            return jsonify({"error": "Unknown strategy"}), 400
+        
+        result = _backtest_strategy(
+            symbol=symbol,
+            strategy=strategy,
+            days_lookback=days_lookback,
+            initial_capital=initial_capital,
+        )
+
+        if isinstance(result, dict):
+            result["requested_strategy"] = strategy_raw
+            result["resolved_strategy"] = strategy
+        
+        return jsonify(result), 200
+    except Exception as e:
+        logger.error(f"Error running backtest: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/summary/overnight", methods=["GET"])
+def get_overnight_summary():
+    """Get summary of overnight trading (what bot did while user slept)."""
+    try:
+        summary = _get_overnight_summary()
+        return jsonify(summary), 200
+    except Exception as e:
+        logger.error(f"Error getting overnight summary: {e}")
         return jsonify({"error": str(e)}), 500
 
 

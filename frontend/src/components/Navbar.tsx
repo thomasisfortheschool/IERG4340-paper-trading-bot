@@ -11,6 +11,8 @@ export default function Navbar() {
     setAccount,
     setSelectedBroker,
     selectedBroker,
+    setActiveTab,
+    setForexAuditFocus,
     bumpRefreshToken,
   } = useTradingStore();
   const [brokerName, setBrokerName] = useState('IBKR');
@@ -29,6 +31,7 @@ export default function Navbar() {
     realized_pnl: 0,
     last_cycle: null as string | null,
   });
+  const [strategyAudit, setStrategyAudit] = useState<any>({});
   const [botLoading, setBotLoading] = useState(false);
   const [switchingBroker, setSwitchingBroker] = useState(false);
   const [brokerSwitchError, setBrokerSwitchError] = useState('');
@@ -48,17 +51,40 @@ export default function Navbar() {
   useEffect(() => {
     const fetchStatus = async () => {
       try {
-        const [healthRes, brokerRes, botRes, botLogRes] = await Promise.all([
-          statusApi.getHealth(),
+        const healthRes = await statusApi.getHealth();
+        const healthy = healthRes.data?.status === 'healthy';
+        setBackendOnline(healthy);
+
+        if (!healthy) {
+          setBrokerName('DEMO');
+          setBrokerConnected(false);
+          setExecutionMode('manual');
+          setBotRunning(false);
+          setBotLastRun(null);
+          setForexGridStats({
+            pairs_configured: 0,
+            open_longs: 0,
+            open_shorts: 0,
+            open_total: 0,
+            realized_pnl: 0,
+            last_cycle: null,
+          });
+          setStrategyAudit({});
+          setBotLatestEvent('Backend offline');
+          setBotLatestEventAt(null);
+          return;
+        }
+
+        const [brokerRes, botRes, botLogRes] = await Promise.all([
           statusApi.getBrokerStatus(),
           botApi.getStatus(),
           botApi.getLogs(1),
         ]);
-        setBackendOnline(healthRes.data?.status === 'healthy');
+
         setBrokerName((brokerRes.data.broker || 'DEMO').toUpperCase());
         setBrokerConnected(Boolean(brokerRes.data.connected));
         const brokerLabel = String(brokerRes.data?.broker || 'demo').toLowerCase();
-        const normalized = brokerLabel.includes('ibkr') ? 'ibkr' : brokerLabel.includes('alpaca') ? 'alpaca' : 'demo';
+        const normalized = brokerLabel.includes('ibkr') ? 'ibkr' : brokerLabel.includes('alpaca') ? 'alpaca' : 'ibkr';
         setSelectedBroker(normalized);
         setExecutionMode((botRes.data.execution_mode || 'manual') as 'manual' | 'automatic');
         setBotRunning(Boolean(botRes.data.bot_running));
@@ -71,6 +97,7 @@ export default function Navbar() {
           realized_pnl: Number(botRes.data?.forex_grid?.realized_pnl ?? 0),
           last_cycle: botRes.data?.forex_grid?.last_cycle ?? null,
         });
+        setStrategyAudit(botRes.data?.strategy_audit || {});
         const latest = (botLogRes.data?.logs || [])[0];
         if (latest?.event) {
           setBotLatestEvent(String(latest.event));
@@ -91,6 +118,7 @@ export default function Navbar() {
           realized_pnl: 0,
           last_cycle: null,
         });
+        setStrategyAudit({});
         setBotLatestEvent('Bot activity unavailable');
         setBotLatestEventAt(null);
       }
@@ -187,23 +215,90 @@ export default function Navbar() {
         ? 'text-emerald-200'
         : 'text-slate-100';
   const gridPnlClass = forexGridStats.realized_pnl >= 0 ? 'text-profit' : 'text-loss';
+  const blowupExecution = String(strategyAudit?.blowup?.execution || 'idle').toLowerCase();
+  const coveredCallExecution = String(strategyAudit?.covered_call?.execution || 'idle').toLowerCase();
+  const forexExecution = String(strategyAudit?.forex_grid?.execution || 'idle').toLowerCase();
+  const forexHealthy = ['simulated', 'live_paper'].includes(forexExecution);
+  const hasEquityFailure = blowupExecution === 'failed' || coveredCallExecution === 'failed';
+  const engineState: 'healthy' | 'attention' | 'paused' | 'offline' = !backendOnline
+    ? 'offline'
+    : !botRunning || executionMode !== 'automatic'
+      ? 'paused'
+      : forexHealthy && !hasEquityFailure
+        ? 'healthy'
+        : 'attention';
+  const engineBadgeClass = engineState === 'healthy'
+    ? 'border-emerald-500/60 bg-emerald-900/25 text-emerald-100'
+    : engineState === 'paused'
+      ? 'border-amber-500/60 bg-amber-900/25 text-amber-100'
+      : engineState === 'offline'
+        ? 'border-rose-500/60 bg-rose-900/25 text-rose-100'
+        : 'border-orange-500/60 bg-orange-900/25 text-orange-100';
+  const engineLabel = engineState === 'healthy'
+    ? 'Strategy Engine Healthy'
+    : engineState === 'paused'
+      ? 'Strategy Engine Paused'
+      : engineState === 'offline'
+        ? 'Backend Offline'
+        : 'Strategy Engine Needs Attention';
+  const engineReason = engineState === 'offline'
+    ? 'Backend offline'
+    : engineState === 'paused'
+      ? 'Run bot in automatic mode to execute sleeves'
+      : `Blowup ${blowupExecution} | Covered call ${coveredCallExecution} | Forex ${forexExecution}`;
+  const focusSleeve: 'all' | 'blowup' | 'covered_call' | 'forex_grid' = !backendOnline || !botRunning || executionMode !== 'automatic'
+    ? 'all'
+    : !['simulated', 'live_paper'].includes(forexExecution)
+      ? 'forex_grid'
+      : !['simulated', 'submitted'].includes(blowupExecution)
+        ? 'blowup'
+        : !['simulated', 'submitted'].includes(coveredCallExecution)
+          ? 'covered_call'
+          : 'all';
+
+  const handleJumpToEngineIssue = () => {
+    setActiveTab('forex');
+    setForexAuditFocus(focusSleeve);
+  };
 
   return (
-    <nav className="sticky top-0 z-20 border-b border-slate-700/50 bg-[#0a1c25]/75 backdrop-blur-md">
-      <div className="app-shell py-3 md:py-4">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-          <div className="space-y-2">
-            <div className="flex items-center gap-3">
-              <div className="rounded-xl bg-teal-400/20 p-2 text-teal-200">
-                <TrendingUp size={22} />
+    <nav className="sticky top-0 z-20 border-b border-slate-700/50 bg-[#0a1c25]/80 backdrop-blur-md">
+      <div className="app-shell py-2">
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="rounded-lg bg-teal-400/20 p-1.5 text-teal-200">
+                <TrendingUp size={16} />
               </div>
-              <div>
-                <h1 className="text-xl sm:text-2xl md:text-3xl font-bold tracking-tight">IERG4340 Trading Bot</h1>
-                <p className="hidden sm:block text-sm text-slate-300">Multi-strategy paper trading dashboard</p>
+              <div className="min-w-0">
+                <h1 className="text-base sm:text-lg font-bold tracking-tight truncate">IERG4340 Trading Bot</h1>
+                <p className="hidden md:block text-[11px] text-slate-300 truncate">Multi-strategy paper trading dashboard</p>
               </div>
             </div>
+
+            <div className="scroll-row gap-2 w-full xl:w-auto">
+              <div className="rounded-lg border border-slate-600/50 bg-slate-900/35 px-3 py-1.5 min-w-[160px]">
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">Total Value</p>
+                <p className="text-lg font-semibold">{currencyPrefix}{Number(account.total_value || 0).toLocaleString()}</p>
+              </div>
+              <div className="rounded-lg border border-slate-600/50 bg-slate-900/35 px-3 py-1.5 min-w-[200px]">
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">Total P&L</p>
+                <p className={`text-lg font-semibold ${pnlColor}`}>
+                  {currencyPrefix}{Number(account.total_pnl || 0).toLocaleString()} ({Number(account.total_pnl_pct || 0).toFixed(2)}%)
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-600/50 bg-slate-900/35 px-3 py-1.5 min-w-[140px]">
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">Today</p>
+                <p className={`text-lg font-semibold ${todayColor}`}>
+                  {currencyPrefix}{Number(account.daily_pnl || 0).toLocaleString()}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="scroll-row gap-2">
             <span
-              className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold border ${
+              className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold border ${
                 brokerConnected
                   ? 'text-emerald-200 bg-emerald-900/40 border-emerald-700/60'
                   : 'text-amber-200 bg-amber-900/40 border-amber-700/60'
@@ -213,128 +308,81 @@ export default function Navbar() {
               {brokerName} {brokerConnected ? 'Connected' : 'Disconnected'}
             </span>
 
-            <div className="flex flex-wrap gap-2">
-              {[
-                { id: 'demo', label: 'Demo' },
-                { id: 'ibkr', label: 'IBKR' },
-                { id: 'alpaca', label: 'Alpaca' },
-              ].map((item) => (
-                <button
-                  key={item.id}
-                  onClick={() => handleDataSourceSwitch(item.id as 'demo' | 'ibkr' | 'alpaca')}
-                  disabled={switchingBroker || !backendOnline}
-                  className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                    selectedBroker === item.id
-                      ? 'border-teal-300 bg-teal-900/25 text-teal-100'
-                      : 'border-slate-600/70 bg-slate-900/45 text-slate-300 hover:border-slate-400'
-                  } ${switchingBroker || !backendOnline ? 'opacity-60 cursor-not-allowed' : ''}`}
-                >
-                  {item.label}
-                </button>
-              ))}
-            </div>
-
-            {brokerSwitchError && (
-              <p className="text-xs text-loss font-semibold">{brokerSwitchError}</p>
-            )}
+            {[
+              { id: 'ibkr', label: 'IBKR' },
+              { id: 'alpaca', label: 'Alpaca' },
+            ].map((item) => (
+              <button
+                key={item.id}
+                onClick={() => handleDataSourceSwitch(item.id as 'demo' | 'ibkr' | 'alpaca')}
+                disabled={switchingBroker || !backendOnline}
+                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                  selectedBroker === item.id
+                    ? 'border-teal-300 bg-teal-900/25 text-teal-100'
+                    : 'border-slate-600/70 bg-slate-900/45 text-slate-300 hover:border-slate-400'
+                } ${switchingBroker || !backendOnline ? 'opacity-60 cursor-not-allowed' : ''}`}
+              >
+                {item.label}
+              </button>
+            ))}
 
             <div className="inline-flex items-center gap-2 rounded-full border border-slate-600/70 bg-slate-900/45 px-2 py-1">
               <span className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-300 px-1">
                 <Bot size={12} /> Bot
               </span>
               <div className="flex items-center gap-1.5">
-                <span className={`text-[10px] font-semibold ${executionMode === 'manual' ? 'text-teal-100' : 'text-slate-400'}`}>
-                  M
-                </span>
+                <span className={`text-[10px] font-semibold ${executionMode === 'manual' ? 'text-teal-100' : 'text-slate-400'}`}>M</span>
                 <button
                   onClick={handleNavToggle}
                   role="switch"
                   aria-checked={executionMode === 'automatic'}
                   disabled={botLoading || !backendOnline}
-                  className={`relative h-6 w-11 shrink-0 rounded-full border transition-all duration-300 ease-out ${
+                  className={`relative h-5 w-10 shrink-0 rounded-full border transition-all duration-300 ease-out ${
                     executionMode === 'automatic'
                       ? 'border-emerald-400/70 bg-emerald-500/30'
                       : 'border-slate-500/70 bg-slate-700/50'
                   } ${botLoading || !backendOnline ? 'opacity-70 cursor-not-allowed' : 'hover:brightness-110'}`}
                 >
                   <span
-                    className={`absolute left-[2px] top-[2px] h-4 w-4 rounded-full bg-white shadow-md transition-transform duration-300 ease-out ${
+                    className={`absolute left-[2px] top-[2px] h-3 w-3 rounded-full bg-white shadow-md transition-transform duration-300 ease-out ${
                       executionMode === 'automatic' ? 'translate-x-5' : 'translate-x-0'
                     }`}
                   />
                 </button>
-                <span className={`text-[10px] font-semibold ${executionMode === 'automatic' ? 'text-teal-100' : 'text-slate-400'}`}>
-                  A
-                </span>
+                <span className={`text-[10px] font-semibold ${executionMode === 'automatic' ? 'text-teal-100' : 'text-slate-400'}`}>A</span>
               </div>
               <span className={`text-[11px] font-semibold ${botRunning ? 'text-profit' : 'text-loss'}`}>
                 {botRunning ? 'Running' : 'Stopped'}
               </span>
-              <span className={`text-[11px] font-semibold ${backendOnline ? 'text-slate-300' : 'text-loss'}`}>
-                {backendOnline ? `Heartbeat ${getHeartbeatAge(botLastRun)} ago` : 'API Offline'}
+            </div>
+
+            <button
+              onClick={handleJumpToEngineIssue}
+              className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${engineBadgeClass}`}
+              title={engineReason}
+            >
+              {engineLabel}
+            </button>
+
+            <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${activityContainerClass}`}>
+              <span className={`font-semibold ${activityTextClass}`}>{botLatestEvent}</span>
+              <span className="text-slate-300">{botLatestEventAt ? `${getHeartbeatAge(botLatestEventAt)} ago` : 'Waiting'}</span>
+            </div>
+
+            <div className="inline-flex items-center gap-2 rounded-full border border-cyan-700/50 bg-cyan-900/15 px-3 py-1 text-xs text-cyan-100">
+              <span>Grid {forexGridStats.open_total} legs</span>
+              <span className={gridPnlClass}>{forexGridStats.realized_pnl >= 0 ? '+' : ''}{forexGridStats.realized_pnl.toFixed(2)}</span>
+              <span className="text-slate-300">{getHeartbeatAge(forexGridStats.last_cycle)} ago</span>
+            </div>
+
+            {backendOnline && (
+              <span className="inline-flex items-center rounded-full border border-slate-600/70 bg-slate-900/45 px-3 py-1 text-xs text-slate-300">
+                Heartbeat {getHeartbeatAge(botLastRun)} ago
               </span>
-            </div>
-
-            <div className={`max-w-full rounded-xl border px-3 py-2 transition-colors ${activityContainerClass}`}>
-              <p className="text-[10px] uppercase tracking-wide text-slate-400">Bot Activity</p>
-              <p className={`text-xs font-semibold truncate ${activityTextClass} ${isScanningEvent && botRunning ? 'animate-pulse' : ''}`}>
-                {botRunning ? 'Running: ' : 'Stopped: '}
-                {botLatestEvent}
-              </p>
-              <p className="text-[11px] text-slate-400">
-                {botLatestEventAt ? `${getHeartbeatAge(botLatestEventAt)} ago` : 'Waiting for next event'}
-                {' | '}
-                Live Orders
-              </p>
-            </div>
-
-            <div className="max-w-full rounded-xl border border-cyan-700/50 bg-cyan-900/15 px-3 py-2">
-              <p className="text-[10px] uppercase tracking-wide text-slate-400">Forex Grid</p>
-              <p className="text-xs font-semibold text-cyan-100 truncate">
-                Open legs {forexGridStats.open_total} (L {forexGridStats.open_longs} / S {forexGridStats.open_shorts})
-              </p>
-              <p className="text-[11px] text-slate-300">
-                Realized: <span className={gridPnlClass}>{forexGridStats.realized_pnl >= 0 ? '+' : ''}{forexGridStats.realized_pnl.toFixed(2)}</span>
-                {' | '}
-                Pairs: {forexGridStats.pairs_configured}
-                {' | '}
-                Last cycle {getHeartbeatAge(forexGridStats.last_cycle)} ago
-              </p>
-            </div>
+            )}
           </div>
 
-          <div className="scroll-row md:grid md:grid-cols-3 md:gap-3 w-full lg:w-auto">
-            <div className="rounded-xl border border-slate-600/50 bg-slate-900/35 px-4 py-3 min-w-[180px] md:min-w-0 shrink-0">
-              <div className="flex items-center gap-2 text-slate-300 text-xs uppercase tracking-wide mb-1">
-                <DollarSign size={14} /> Total Value
-              </div>
-              <div>
-                <p className="metric-value">{currencyPrefix}{Number(account.total_value || 0).toLocaleString()}</p>
-              </div>
-            </div>
-
-            <div className="rounded-xl border border-slate-600/50 bg-slate-900/35 px-4 py-3 min-w-[220px] md:min-w-0 shrink-0">
-              <div className="flex items-center gap-2 text-slate-300 text-xs uppercase tracking-wide mb-1">
-                <TrendingUp size={14} className={pnlColor} /> Total P&L
-              </div>
-              <div>
-                <p className={`metric-value ${pnlColor}`}>
-                  {currencyPrefix}{Number(account.total_pnl || 0).toLocaleString()} ({Number(account.total_pnl_pct || 0).toFixed(2)}%)
-                </p>
-              </div>
-            </div>
-
-            <div className="rounded-xl border border-slate-600/50 bg-slate-900/35 px-4 py-3 min-w-[180px] md:min-w-0 shrink-0">
-              <div className="flex items-center gap-2 text-slate-300 text-xs uppercase tracking-wide mb-1">
-                <Wallet size={14} /> Today
-              </div>
-              <div>
-                <p className={`metric-value ${todayColor}`}>
-                  {currencyPrefix}{Number(account.daily_pnl || 0).toLocaleString()}
-                </p>
-              </div>
-            </div>
-          </div>
+          {brokerSwitchError && <p className="text-xs text-loss font-semibold">{brokerSwitchError}</p>}
         </div>
       </div>
     </nav>
