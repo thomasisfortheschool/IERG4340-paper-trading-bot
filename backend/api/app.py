@@ -12,11 +12,11 @@ import time
 import socket
 import random
 import uuid
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from datetime import datetime, timedelta
 import yfinance as yf
@@ -48,11 +48,21 @@ from brokers.alpaca_broker import AlpacaBroker  # Register in BrokerFactory
 from screeners.fundamental_screener import FundamentalScreener
 from screeners.option_screener import OptionScreener
 from bots.strategies import BlowupStockBot, CoveredCallBot, ForexBot
-from data.mock_data import MockPortfolioGenerator
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _configure_dependency_log_levels() -> None:
+    """Reduce verbose third-party logs while keeping warnings/errors visible."""
+    ib_level_name = str(os.getenv("IB_INSYNC_LOG_LEVEL", "WARNING") or "WARNING").upper().strip()
+    ib_level = getattr(logging, ib_level_name, logging.WARNING)
+    for name in ("ib_insync.wrapper", "ib_insync.ib"):
+        logging.getLogger(name).setLevel(ib_level)
+
+
+_configure_dependency_log_levels()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -61,7 +71,7 @@ CORS(app)
 # Global state
 state = {
     "broker": None,
-    "broker_name": "demo",
+    "broker_name": "ibkr",
     "config_manager": None,
     "broker_init_attempted": False,
     "portfolio_data": {},
@@ -96,15 +106,72 @@ state = {
     "crypto_daily_loss_current": 0.0,
     "crypto_daily_loss_date": datetime.now().strftime("%Y-%m-%d"),
     "crypto_daily_loss_halted": False,
+    "last_broker_snapshot": {},
+    "ops_metrics": {
+        "started_at": datetime.now().isoformat(),
+        "total_requests": 0,
+        "status_2xx": 0,
+        "status_4xx": 0,
+        "status_5xx": 0,
+        "total_errors": 0,
+        "total_latency_ms": 0.0,
+        "max_latency_ms": 0.0,
+        "endpoints": {},
+    },
 }
 
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 TRADE_HISTORY_FILE = BACKEND_ROOT / "data" / "trade_history.json"
 WATCHLISTS_FILE = BACKEND_ROOT / "data" / "watchlists.json"
 SIM_PORTFOLIOS_FILE = BACKEND_ROOT / "data" / "simulated_portfolios.json"
+BROKER_SNAPSHOT_FILE = BACKEND_ROOT / "data" / "last_broker_snapshot.json"
 TRADE_HISTORY_LOCK = threading.Lock()
 WATCHLISTS_LOCK = threading.Lock()
 SIM_PORTFOLIOS_LOCK = threading.Lock()
+BROKER_SNAPSHOT_LOCK = threading.Lock()
+OPS_METRICS_LOCK = threading.Lock()
+
+
+def _record_request_metrics(path: str, status_code: int, latency_ms: float) -> None:
+    with OPS_METRICS_LOCK:
+        metrics = state.get("ops_metrics")
+        if not isinstance(metrics, dict):
+            return
+
+        metrics["total_requests"] = int(metrics.get("total_requests", 0)) + 1
+        if status_code >= 500:
+            metrics["status_5xx"] = int(metrics.get("status_5xx", 0)) + 1
+            metrics["total_errors"] = int(metrics.get("total_errors", 0)) + 1
+        elif status_code >= 400:
+            metrics["status_4xx"] = int(metrics.get("status_4xx", 0)) + 1
+        else:
+            metrics["status_2xx"] = int(metrics.get("status_2xx", 0)) + 1
+
+        metrics["total_latency_ms"] = float(metrics.get("total_latency_ms", 0.0) or 0.0) + float(latency_ms)
+        metrics["max_latency_ms"] = max(float(metrics.get("max_latency_ms", 0.0) or 0.0), float(latency_ms))
+
+        endpoints = metrics.get("endpoints")
+        if not isinstance(endpoints, dict):
+            endpoints = {}
+            metrics["endpoints"] = endpoints
+
+        key = str(path or "unknown")[:120]
+        bucket = endpoints.get(key)
+        if not isinstance(bucket, dict):
+            if len(endpoints) >= 200 and key not in endpoints:
+                # Keep memory bounded by dropping the least-hit endpoint.
+                least_key = min(endpoints.keys(), key=lambda k: int(endpoints.get(k, {}).get("count", 0) or 0))
+                endpoints.pop(least_key, None)
+            bucket = {"count": 0, "errors": 0, "last_status": 200, "avg_latency_ms": 0.0, "max_latency_ms": 0.0}
+            endpoints[key] = bucket
+
+        count = int(bucket.get("count", 0)) + 1
+        prev_avg = float(bucket.get("avg_latency_ms", 0.0) or 0.0)
+        bucket["count"] = count
+        bucket["last_status"] = int(status_code)
+        bucket["errors"] = int(bucket.get("errors", 0)) + (1 if status_code >= 500 else 0)
+        bucket["avg_latency_ms"] = ((prev_avg * (count - 1)) + float(latency_ms)) / count
+        bucket["max_latency_ms"] = max(float(bucket.get("max_latency_ms", 0.0) or 0.0), float(latency_ms))
 
 
 def _load_persisted_trade_logs() -> list[dict[str, Any]]:
@@ -162,6 +229,107 @@ def _save_json_list(file_path: Path, rows: list[dict[str, Any]]) -> None:
             json.dump(rows, handle, indent=2)
     except Exception as e:
         logging.getLogger(__name__).warning("Failed to save %s: %s", file_path.name, e)
+
+
+def _load_broker_snapshot_cache() -> dict[str, Any]:
+    try:
+        if not BROKER_SNAPSHOT_FILE.exists():
+            return {}
+        with BROKER_SNAPSHOT_FILE.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as e:
+        logging.getLogger(__name__).warning("Failed to load last broker snapshot: %s", e)
+        return {}
+
+
+def _save_broker_snapshot_cache(payload: dict[str, Any]) -> None:
+    try:
+        BROKER_SNAPSHOT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with BROKER_SNAPSHOT_FILE.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except Exception as e:
+        logging.getLogger(__name__).warning("Failed to save last broker snapshot: %s", e)
+
+
+def _snapshot_cache() -> dict[str, Any]:
+    snap = state.get("last_broker_snapshot")
+    return snap if isinstance(snap, dict) else {}
+
+
+def _update_broker_snapshot_cache(
+    *,
+    account: dict[str, Any] | None = None,
+    positions: list[dict[str, Any]] | None = None,
+    history_days: int | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> None:
+    with BROKER_SNAPSHOT_LOCK:
+        current = dict(_snapshot_cache())
+        current["broker"] = str(state.get("broker_name", "ibkr") or "ibkr")
+        current["updated_at"] = datetime.now().isoformat()
+
+        if isinstance(account, dict):
+            current["account"] = account
+            current["account_updated_at"] = current["updated_at"]
+
+        if isinstance(positions, list):
+            current["positions"] = positions
+            current["positions_updated_at"] = current["updated_at"]
+
+        if isinstance(history, list) and history_days is not None:
+            history_map = current.get("portfolio_history")
+            if not isinstance(history_map, dict):
+                history_map = {}
+            history_map[str(max(2, int(history_days)))] = history
+            current["portfolio_history"] = history_map
+            current["history_updated_at"] = current["updated_at"]
+
+        state["last_broker_snapshot"] = current
+        _save_broker_snapshot_cache(current)
+
+
+def _get_cached_account_snapshot() -> dict[str, Any] | None:
+    account = _snapshot_cache().get("account")
+    return account if isinstance(account, dict) else None
+
+
+def _get_cached_positions_snapshot() -> list[dict[str, Any]]:
+    positions = _snapshot_cache().get("positions")
+    if isinstance(positions, list):
+        return [row for row in positions if isinstance(row, dict)]
+    return []
+
+
+def _get_cached_history_snapshot(days: int) -> list[dict[str, Any]]:
+    history_map = _snapshot_cache().get("portfolio_history")
+    if not isinstance(history_map, dict):
+        return []
+
+    requested = str(max(2, int(days)))
+    rows = history_map.get(requested)
+    if isinstance(rows, list):
+        return [row for row in rows if isinstance(row, dict)]
+
+    # Fall back to nearest available window if exact key is missing.
+    best_key = None
+    best_distance = None
+    for key in history_map.keys():
+        try:
+            key_days = int(str(key))
+        except Exception:
+            continue
+        dist = abs(key_days - int(requested))
+        if best_distance is None or dist < best_distance:
+            best_distance = dist
+            best_key = key
+
+    if best_key is None:
+        return []
+    rows = history_map.get(best_key)
+    if isinstance(rows, list):
+        return [row for row in rows if isinstance(row, dict)]
+    return []
 
 
 def _now_iso() -> str:
@@ -223,10 +391,10 @@ def _get_latest_market_price(symbol: str) -> float:
 
 def _current_account_total_value() -> float:
     if state.get("broker") is None:
-        try:
-            return float(MockPortfolioGenerator().generate_account_snapshot().get("total_value", 100000.0) or 100000.0)
-        except Exception:
-            return 100000.0
+        cached = _get_cached_account_snapshot()
+        if cached is not None:
+            return float(cached.get("total_value", 0.0) or 0.0)
+        return 0.0
 
     try:
         account = run_async(state["broker"].get_account_snapshot())
@@ -308,7 +476,7 @@ def _log_trade(
     strategy: str = "unknown",
     entry_reason: str = "",
     mode: str = "simulated",
-    broker: str = "demo",
+    broker: str = "ibkr",
 ) -> dict[str, Any]:
     """
     Log a completed trade to the persistent trade history.
@@ -736,6 +904,7 @@ def _save_simulated_portfolios(rows: list[dict[str, Any]]) -> None:
 
 state["watchlists"] = _load_watchlists()
 state["simulated_portfolios"] = _load_simulated_portfolios()
+state["last_broker_snapshot"] = _load_broker_snapshot_cache()
 
 
 state["simulated_trade_logs"] = deque(_load_persisted_trade_logs(), maxlen=500)
@@ -840,6 +1009,7 @@ class BotRunner:
         self._stop_event.clear()
         full_cycle_seconds = max(10, int(interval_seconds or 60))
         state["bot_interval_seconds"] = full_cycle_seconds
+        state["execution_mode"] = "automatic"
 
         def _loop():
             logger.info("Automatic bot runner started")
@@ -910,7 +1080,7 @@ class BotRunner:
         append_bot_log(
             "Scanning market for opportunities",
             details={
-                "broker": state.get("broker_name", "demo"),
+                "broker": state.get("broker_name", "ibkr"),
                 "dry_run": state.get("bot_dry_run", True),
             },
         )
@@ -947,7 +1117,7 @@ class BotRunner:
 
         state["scan_results"] = {
             "timestamp": datetime.now().isoformat(),
-            "source": "live" if broker is not None else "demo",
+            "source": "live" if broker is not None else "last_connected_snapshot",
             "stocks": stocks,
             "covered_calls": calls,
             "forex": forex,
@@ -1311,6 +1481,7 @@ class BotRunner:
         grid_step_pct = float(forex_cfg.get("grid_step_pct", 0.0015) or 0.0015)
         max_legs = max(1, min(int(forex_cfg.get("grid_max_legs_per_pair", 3) or 3), 8))
         take_profit_steps = max(1, min(int(forex_cfg.get("grid_take_profit_steps", 1) or 1), 3))
+        min_net_after_fees = max(0.05, float(forex_cfg.get("min_net_after_fees", 0.5) or 0.5))
 
         crypto_cfg = cfg.get("crypto", {}) if isinstance(cfg, dict) else {}
         crypto_enabled = bool(crypto_cfg.get("enabled", False))
@@ -1461,7 +1632,10 @@ class BotRunner:
             for leg in pair_state["open_longs"]:
                 entry = float(leg.get("entry_price", price) or price)
                 leg_qty = int(leg.get("quantity", qty) or qty)
-                if price >= entry * (1.0 + tp_pct):
+                fees = max(0.5, leg_qty * 0.00002)
+                min_tp_pct = (fees + min_net_after_fees) / max(entry * max(leg_qty, 1), 1e-9)
+                required_tp_pct = max(tp_pct, min_tp_pct)
+                if price >= entry * (1.0 + required_tp_pct):
                     submitted = self._submit_grid_order(
                         broker=broker,
                         symbol=pair,
@@ -1472,7 +1646,6 @@ class BotRunner:
                     )
                     if submitted:
                         pnl = (price - entry) * leg_qty
-                        fees = max(0.5, leg_qty * 0.00002)
                         net = round(float(pnl - fees), 2)
                         realized_total += net
                         pair_state["realized_pnl"] = round(float(pair_state.get("realized_pnl", 0.0) or 0.0) + net, 2)
@@ -1497,7 +1670,10 @@ class BotRunner:
             for leg in pair_state["open_shorts"]:
                 entry = float(leg.get("entry_price", price) or price)
                 leg_qty = int(leg.get("quantity", qty) or qty)
-                if price <= entry * (1.0 - tp_pct):
+                fees = max(0.5, leg_qty * 0.00002)
+                min_tp_pct = (fees + min_net_after_fees) / max(entry * max(leg_qty, 1), 1e-9)
+                required_tp_pct = max(tp_pct, min_tp_pct)
+                if price <= entry * (1.0 - required_tp_pct):
                     submitted = self._submit_grid_order(
                         broker=broker,
                         symbol=pair,
@@ -1508,7 +1684,6 @@ class BotRunner:
                     )
                     if submitted:
                         pnl = (entry - price) * leg_qty
-                        fees = max(0.5, leg_qty * 0.00002)
                         net = round(float(pnl - fees), 2)
                         realized_total += net
                         pair_state["realized_pnl"] = round(float(pair_state.get("realized_pnl", 0.0) or 0.0) + net, 2)
@@ -1797,6 +1972,7 @@ class BotRunner:
         fee_estimate = max(0.5, float(quantity) * 0.00002)
         if asset_type == "crypto":
             fee_estimate = max(0.25, ((float(entry_price) + float(exit_price)) * 0.5 * float(quantity) * 0.001))
+        gross_pnl = float(net_pnl) + float(fee_estimate)
 
         return {
             "trade_id": f"GRID-{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
@@ -1810,7 +1986,7 @@ class BotRunner:
             "entry_price": round(float(entry_price), 5),
             "exit_price": round(float(exit_price), 5),
             "fees": round(float(fee_estimate), 2),
-            "gross_pnl": round(float(net_pnl), 2),
+            "gross_pnl": round(float(gross_pnl), 2),
             "net_pnl": round(float(net_pnl), 2),
             "status": "closed",
             "order_submitted": not dry_run,
@@ -1867,7 +2043,7 @@ def load_broker_from_env():
     broker_type = os.getenv("BROKER_TYPE", "ibkr").lower().strip()
 
     if broker_type in {"", "demo", "mock"}:
-        return None, "demo", {"mode": "demo"}
+        raise ValueError("BROKER_TYPE demo/mock is no longer supported. Use 'ibkr' or 'alpaca'.")
 
     return build_and_connect_broker(broker_type)
 
@@ -2161,7 +2337,7 @@ def switch_broker(broker_type: str, config: dict = None):
 def get_positions_for_recommendation():
     """Get current positions for recommendation scoring."""
     if state["broker"] is None:
-        return MockPortfolioGenerator().generate_positions()
+        return _get_cached_positions_snapshot()
 
     broker_positions = run_async(state["broker"].get_positions()) or []
     return [asdict(p) for p in broker_positions]
@@ -2283,9 +2459,8 @@ def initialize():
             logger.info(f"Broker initialized: {state['broker_name']}")
         except Exception as e:
             logger.error(f"Broker initialization failed: {e}")
-            # Fall back to mock data
             state["broker"] = None
-            state["broker_name"] = "demo"
+            state["broker_name"] = str(os.getenv("BROKER_TYPE", "ibkr") or "ibkr").lower().strip() or "ibkr"
             state["broker_runtime_config"] = {}
             state["broker_init_error"] = str(e)
 
@@ -2312,6 +2487,20 @@ def initialize():
         except Exception as e:
             logger.error(f"Auto-start bot initialization failed: {e}")
     "SNPS", "SQ", "RBLX", "DDOG", "ZS", "TTD", "WDAY",
+
+
+@app.before_request
+def _track_request_start():
+    g._request_started_at = time.perf_counter()
+
+
+@app.after_request
+def _track_request_end(response):
+    started_at = getattr(g, "_request_started_at", None)
+    if started_at is not None:
+        elapsed_ms = (time.perf_counter() - float(started_at)) * 1000.0
+        _record_request_metrics(request.path, int(getattr(response, "status_code", 200)), elapsed_ms)
+    return response
 
 
 def normalize_execution_mode(mode: str) -> str:
@@ -2348,6 +2537,42 @@ def _today_local_trade_net_pnl() -> float:
     return round(total, 2)
 
 
+def _normalize_account_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    """Ensure account payload exposes realized and unrealized P&L fields."""
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized = dict(payload)
+    total_value = float(normalized.get("total_value", 0) or 0.0)
+    total_pnl = float(normalized.get("total_pnl", 0) or 0.0)
+    positions = normalized.get("positions")
+    positions_unrealized = 0.0
+    if isinstance(positions, list):
+        positions_unrealized = sum(float(row.get("pnl", 0) or 0.0) for row in positions if isinstance(row, dict))
+
+    unrealized = normalized.get("unrealized_pnl")
+    if unrealized is None:
+        unrealized = positions_unrealized
+    unrealized = float(unrealized or 0.0)
+
+    # Keep top-bar and positions tab aligned when broker summary unrealized drifts.
+    if isinstance(positions, list) and abs(unrealized - positions_unrealized) > 0.01:
+        unrealized = positions_unrealized
+
+    realized = normalized.get("realized_pnl")
+    if realized is None:
+        realized = total_pnl - unrealized
+    realized = float(realized or 0.0)
+
+    base = max(total_value - total_pnl, 0.0)
+    normalized["realized_pnl"] = round(realized, 2)
+    normalized["realized_pnl_pct"] = round((realized / base * 100.0) if base else 0.0, 2)
+    normalized["unrealized_pnl"] = round(unrealized, 2)
+    normalized["unrealized_pnl_pct"] = round((unrealized / base * 100.0) if base else 0.0, 2)
+
+    return normalized
+
+
 # ============ Portfolio & Account Endpoints ============
 
 @app.route("/api/account", methods=["GET"])
@@ -2355,17 +2580,17 @@ def get_account():
     """Get current account snapshot."""
     try:
         if state["broker"] is None:
-            # Return mock data
-            mock_gen = MockPortfolioGenerator()
-            payload = mock_gen.generate_account_snapshot()
-            local_today = _today_local_trade_net_pnl()
-            payload["daily_pnl"] = round(float(payload.get("daily_pnl", 0) or 0) + local_today, 2)
-            base = float(payload.get("total_value", 0) or 0) - float(payload.get("total_pnl", 0) or 0)
-            payload["daily_pnl_pct"] = round((payload["daily_pnl"] / base * 100.0) if base else 0.0, 2)
-            return jsonify(payload), 200
+            payload = _get_cached_account_snapshot()
+            if payload is None:
+                return jsonify({"error": "Broker not connected and no cached account snapshot is available yet."}), 503
+            cached = _normalize_account_snapshot(dict(payload))
+            cached["data_fresh"] = False
+            cached["data_source"] = "last_connected_snapshot"
+            cached["snapshot_timestamp"] = _snapshot_cache().get("account_updated_at") or _snapshot_cache().get("updated_at")
+            return jsonify(cached), 200
         
         account = run_async(state["broker"].get_account_snapshot())
-        payload = asdict(account)
+        payload = _normalize_account_snapshot(asdict(account))
 
         # IB snapshots may report 0 daily P&L in paper mode right after tiny test trades.
         # Fall back to today's locally tracked trade records so the navbar reflects reality.
@@ -2375,6 +2600,10 @@ def get_account():
             payload["daily_pnl"] = round(local_today, 2)
             base = float(payload.get("total_value", 0) or 0) - float(payload.get("total_pnl", 0) or 0)
             payload["daily_pnl_pct"] = round((local_today / base * 100.0) if base else 0.0, 2)
+
+        payload["data_fresh"] = True
+        payload["data_source"] = "live_broker"
+        _update_broker_snapshot_cache(account=payload)
 
         return jsonify(payload), 200
     except Exception as e:
@@ -2387,12 +2616,22 @@ def get_positions():
     """Get list of open positions."""
     try:
         if state["broker"] is None:
-            mock_gen = MockPortfolioGenerator()
-            positions = mock_gen.generate_positions()
-            return jsonify({"positions": positions}), 200
+            positions = _get_cached_positions_snapshot()
+            if not positions:
+                return jsonify({"error": "Broker not connected and no cached positions are available yet."}), 503
+            return jsonify(
+                {
+                    "positions": positions,
+                    "data_fresh": False,
+                    "data_source": "last_connected_snapshot",
+                    "snapshot_timestamp": _snapshot_cache().get("positions_updated_at") or _snapshot_cache().get("updated_at"),
+                }
+            ), 200
         
         positions = run_async(state["broker"].get_positions())
-        return jsonify({"positions": [asdict(p) for p in positions]}), 200
+        payload = [asdict(p) for p in positions]
+        _update_broker_snapshot_cache(positions=payload)
+        return jsonify({"positions": payload, "data_fresh": True, "data_source": "live_broker"}), 200
     except Exception as e:
         logger.error(f"Error getting positions: {e}")
         return jsonify({"error": str(e)}), 500
@@ -2405,10 +2644,22 @@ def get_portfolio_history():
         days = request.args.get("days", 30, type=int)
 
         history = build_live_portfolio_history(days)
-        if not history:
-            mock_gen = MockPortfolioGenerator()
-            history = mock_gen.generate_daily_pnl_history(days=days)
-        return jsonify({"history": history}), 200
+        if history:
+            _update_broker_snapshot_cache(history_days=days, history=history)
+            return jsonify({"history": history, "data_fresh": True, "data_source": "live_broker"}), 200
+
+        cached_history = _get_cached_history_snapshot(days)
+        if cached_history:
+            return jsonify(
+                {
+                    "history": cached_history,
+                    "data_fresh": False,
+                    "data_source": "last_connected_snapshot",
+                    "snapshot_timestamp": _snapshot_cache().get("history_updated_at") or _snapshot_cache().get("updated_at"),
+                }
+            ), 200
+
+        return jsonify({"error": "Broker not connected and no cached portfolio history is available yet."}), 503
     except Exception as e:
         logger.error(f"Error getting portfolio history: {e}")
         return jsonify({"error": str(e)}), 500
@@ -2980,11 +3231,6 @@ def screen_covered_calls():
             opportunities = _screen_covered_calls_yfinance(option_cfg)
             source = "yfinance_options"
 
-        if not opportunities:
-            mock_gen = MockPortfolioGenerator()
-            opportunities = mock_gen.generate_covered_call_opportunities()
-            source = "demo_fallback"
-
         return jsonify({"opportunities": opportunities, "meta": {"source": source}}), 200
     except Exception as e:
         logger.error(f"Error screening calls: {e}")
@@ -2998,10 +3244,6 @@ def screen_forex():
         _, _, forex_cfg = _load_screening_configs()
         opportunities = _screen_forex_yfinance(forex_cfg)
         source = "yfinance_fx"
-        if not opportunities:
-            mock_gen = MockPortfolioGenerator()
-            opportunities = mock_gen.generate_forex_opportunities()
-            source = "demo_fallback"
         return jsonify({"opportunities": opportunities, "meta": {"source": source}}), 200
     except Exception as e:
         logger.error(f"Error screening forex: {e}")
@@ -3034,13 +3276,7 @@ def place_order():
             return jsonify({"error": "quantity must be greater than 0"}), 400
         
         if state["broker"] is None:
-            return jsonify({
-                "status": "success",
-                "order_id": "DEMO-12345",
-                "symbol": symbol,
-                "side": side,
-                "quantity": quantity,
-            }), 200
+            return jsonify({"error": "No broker connected. Connect IBKR/Alpaca before placing orders."}), 503
 
         if not confirm_live:
             return jsonify({"error": "confirm_live=true is required for broker-backed orders"}), 400
@@ -3216,6 +3452,8 @@ def get_bot_status():
     """Get current execution mode and bot lifecycle state."""
     running = bot_runner.is_running()
     state["bot_running"] = running
+    if running and state.get("execution_mode") != "automatic":
+        state["execution_mode"] = "automatic"
 
     grid_state = state.get("forex_grid_state") or {}
     pairs = grid_state.get("pairs") or {}
@@ -3378,6 +3616,7 @@ def start_bot_runner():
 
         data = request.json or {}
         interval = int(data.get("interval_seconds", 60))
+        state["execution_mode"] = "automatic"
         state["bot_dry_run"] = False
         append_bot_log(
             "Bot start forcing live execution",
@@ -3405,6 +3644,7 @@ def stop_bot_runner():
     """Stop automatic bot runner."""
     try:
         stopped = bot_runner.stop()
+        state["execution_mode"] = "manual"
         append_bot_log("Bot stop requested", details={"stopped": stopped})
         return jsonify({"status": "success", "stopped": stopped, "bot_running": False}), 200
     except Exception as e:
@@ -3443,11 +3683,14 @@ def get_broker_status():
     """Get broker connection status."""
     try:
         connected = state["broker"] is not None
+        broker_name = str(state.get("broker_name", "ibkr") or "ibkr").upper()
         return jsonify({
             "connected": connected,
-            "broker": state["broker_name"].upper() if connected else "Demo",
-            "account_type": "paper" if connected else "mock",
+            "broker": broker_name,
+            "account_type": "paper" if connected else "disconnected",
             "runtime_config": state.get("broker_runtime_config", {}),
+            "has_cached_snapshot": bool(_get_cached_account_snapshot()),
+            "snapshot_timestamp": _snapshot_cache().get("updated_at"),
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3455,7 +3698,7 @@ def get_broker_status():
 
 def _build_broker_capabilities() -> dict[str, Any]:
     broker = state.get("broker")
-    broker_name = str(state.get("broker_name", "demo") or "demo")
+    broker_name = str(state.get("broker_name", "ibkr") or "ibkr")
     connected = bool(broker is not None)
     paper_trading = bool(getattr(broker, "paper_trading", False)) if broker is not None else True
 
@@ -3508,7 +3751,7 @@ def get_broker_options():
             "connected": state["broker"] is not None,
             "active_config": state.get("broker_runtime_config", {}),
             "capabilities": _build_broker_capabilities(),
-            "available": ["ibkr", "alpaca", "demo"],
+            "available": ["ibkr", "alpaca"],
             "defaults": {
                 "ibkr": {
                     "host": os.getenv("IB_HOST", "127.0.0.1"),
@@ -3535,14 +3778,8 @@ def post_switch_broker():
         if state.get("bot_running"):
             return jsonify({"error": "Stop the bot before switching brokers."}), 400
 
-        if broker_type == "demo":
-            state["broker"] = None
-            state["broker_name"] = "demo"
-            state["broker_runtime_config"] = {}
-            return jsonify({"status": "success", "broker": "demo", "connected": False, "config": {}}), 200
-
         if broker_type not in {"ibkr", "alpaca"}:
-            return jsonify({"error": "broker must be one of: ibkr, alpaca, demo"}), 400
+            return jsonify({"error": "broker must be one of: ibkr, alpaca"}), 400
 
         active, runtime_cfg = switch_broker(broker_type, config)
         return jsonify({"status": "success", "broker": active, "connected": True, "config": runtime_cfg or {}}), 200
@@ -3809,6 +4046,54 @@ def health_check():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
 
 
+@app.route("/api/status/health/counters", methods=["GET"])
+def health_counters():
+    """Lightweight backend counters for demo validation and runtime monitoring."""
+    with OPS_METRICS_LOCK:
+        metrics = dict(state.get("ops_metrics") or {})
+        endpoints = dict(metrics.get("endpoints") or {})
+
+    total_requests = int(metrics.get("total_requests", 0) or 0)
+    total_latency = float(metrics.get("total_latency_ms", 0.0) or 0.0)
+    avg_latency = (total_latency / total_requests) if total_requests > 0 else 0.0
+
+    top_by_count = sorted(
+        (
+            {
+                "path": path,
+                "count": int(data.get("count", 0) or 0),
+                "errors": int(data.get("errors", 0) or 0),
+                "avg_latency_ms": round(float(data.get("avg_latency_ms", 0.0) or 0.0), 2),
+                "max_latency_ms": round(float(data.get("max_latency_ms", 0.0) or 0.0), 2),
+                "last_status": int(data.get("last_status", 200) or 200),
+            }
+            for path, data in endpoints.items()
+        ),
+        key=lambda item: item["count"],
+        reverse=True,
+    )[:10]
+
+    return jsonify(
+        {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "uptime_started_at": metrics.get("started_at"),
+            "broker_connected": bool(state.get("broker") is not None),
+            "bot_running": bool(state.get("bot_running", False)),
+            "summary": {
+                "total_requests": total_requests,
+                "status_2xx": int(metrics.get("status_2xx", 0) or 0),
+                "status_4xx": int(metrics.get("status_4xx", 0) or 0),
+                "status_5xx": int(metrics.get("status_5xx", 0) or 0),
+                "total_errors": int(metrics.get("total_errors", 0) or 0),
+                "avg_latency_ms": round(avg_latency, 2),
+                "max_latency_ms": round(float(metrics.get("max_latency_ms", 0.0) or 0.0), 2),
+            },
+            "top_endpoints": top_by_count,
+        }
+    ), 200
+
+
 # ============ Error Handlers ============
 
 # ============ Enhanced Features: Strategy Customization, Risk Management, Backtesting ============
@@ -4017,15 +4302,15 @@ def get_position_risks():
     try:
         broker = state.get("broker")
         account_snapshot = None
-        
+
         if broker is None:
-            mock_gen = MockPortfolioGenerator()
-            account_snapshot = mock_gen.generate_account_snapshot()
-            positions = mock_gen.generate_positions()
+            account_snapshot = _get_cached_account_snapshot() or {}
+            positions = _get_cached_positions_snapshot()
         else:
             account_snapshot = asdict(run_async(broker.get_account_snapshot()))
             pos_obj = run_async(broker.get_positions()) or []
             positions = [asdict(p) for p in pos_obj]
+            _update_broker_snapshot_cache(account=account_snapshot, positions=positions)
 
         portfolio_value = float((account_snapshot or {}).get("total_value") or 0.0)
         cash_balance = float((account_snapshot or {}).get("cash") or 0.0)
@@ -4246,7 +4531,7 @@ def log_new_trade():
             strategy=strategy,
             entry_reason=entry_reason,
             mode=mode,
-            broker=state.get("broker_name", "demo"),
+            broker=state.get("broker_name", "ibkr"),
         )
         
         return jsonify({
@@ -4365,4 +4650,6 @@ def internal_error(error):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    host = os.getenv("BACKEND_HOST", "0.0.0.0")
+    port = int(os.getenv("BACKEND_PORT", "5000"))
+    app.run(debug=True, host=host, port=port)

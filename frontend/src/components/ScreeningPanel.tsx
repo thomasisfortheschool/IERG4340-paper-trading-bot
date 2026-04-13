@@ -185,6 +185,21 @@ export default function ScreeningPanel() {
   const [profileMessage, setProfileMessage] = useState('');
   const [loading, setLoading] = useState(true);
 
+  const withTimeout = async <T,>(promise: Promise<T>, ms: number): Promise<T> => {
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('request timeout')), ms);
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+  };
+
   useEffect(() => {
     try {
       const raw = localStorage.getItem(SAVED_SCANNER_KEY);
@@ -207,63 +222,73 @@ export default function ScreeningPanel() {
   }, [savedProfiles]);
 
   useEffect(() => {
+    let canceled = false;
+
     const fetchScreeningResults = async () => {
       setLoading(true);
       setFetchError('');
-      const healthResult = await statusApi.getHealth().catch(() => null);
-      const healthy = healthResult?.data?.status === 'healthy';
-      setBackendOnline(healthy);
+      try {
+        const healthResult = await withTimeout(statusApi.getHealth(), 6000).catch(() => null);
+        const healthy = healthResult?.data?.status === 'healthy';
+        if (canceled) return;
+        setBackendOnline(healthy);
 
-      if (!healthy) {
-        setBlowupStocks([]);
-        setCoveredCalls([]);
-        setForex([]);
-        setStocksSource('unavailable');
-        setCallsSource('unavailable');
-        setForexSource('unavailable');
-        setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
-        setLoading(false);
-        return;
+        if (!healthy) {
+          setBlowupStocks([]);
+          setCoveredCalls([]);
+          setForex([]);
+          setStocksSource('unavailable');
+          setCallsSource('unavailable');
+          setForexSource('unavailable');
+          setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
+          return;
+        }
+
+        const [stocksRes, callsRes, forexRes] = await Promise.allSettled([
+          withTimeout(screeningApi.blowupStocks(appliedFilters), 12000),
+          withTimeout(screeningApi.coveredCalls(), 12000),
+          withTimeout(screeningApi.forex(), 12000),
+        ]);
+        if (canceled) return;
+
+        if (stocksRes.status === 'fulfilled') {
+          setBlowupStocks(stocksRes.value.data.candidates || []);
+          setStocksSource(String(stocksRes.value.data?.meta?.source || 'unknown'));
+        } else {
+          setBlowupStocks([]);
+          setStocksSource('unavailable');
+        }
+
+        if (callsRes.status === 'fulfilled') {
+          setCoveredCalls(callsRes.value.data.opportunities || []);
+          setCallsSource(String(callsRes.value.data?.meta?.source || 'unknown'));
+        } else {
+          setCoveredCalls([]);
+          setCallsSource('unavailable');
+        }
+
+        if (forexRes.status === 'fulfilled') {
+          setForex(forexRes.value.data.opportunities || []);
+          setForexSource(String(forexRes.value.data?.meta?.source || 'unknown'));
+        } else {
+          setForex([]);
+          setForexSource('unavailable');
+        }
+
+        if (stocksRes.status === 'rejected' && callsRes.status === 'rejected' && forexRes.status === 'rejected') {
+          setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
+        }
+      } finally {
+        if (!canceled) {
+          setLoading(false);
+        }
       }
-
-      const [stocksRes, callsRes, forexRes] = await Promise.allSettled([
-        screeningApi.blowupStocks(appliedFilters),
-        screeningApi.coveredCalls(),
-        screeningApi.forex(),
-      ]);
-
-      if (stocksRes.status === 'fulfilled') {
-        setBlowupStocks(stocksRes.value.data.candidates || []);
-        setStocksSource(String(stocksRes.value.data?.meta?.source || 'unknown'));
-      } else {
-        setBlowupStocks([]);
-        setStocksSource('unavailable');
-      }
-
-      if (callsRes.status === 'fulfilled') {
-        setCoveredCalls(callsRes.value.data.opportunities || []);
-        setCallsSource(String(callsRes.value.data?.meta?.source || 'unknown'));
-      } else {
-        setCoveredCalls([]);
-        setCallsSource('unavailable');
-      }
-
-      if (forexRes.status === 'fulfilled') {
-        setForex(forexRes.value.data.opportunities || []);
-        setForexSource(String(forexRes.value.data?.meta?.source || 'unknown'));
-      } else {
-        setForex([]);
-        setForexSource('unavailable');
-      }
-
-      if (stocksRes.status === 'rejected' && callsRes.status === 'rejected' && forexRes.status === 'rejected') {
-        setFetchError('Signals API is unreachable right now. Check backend server on port 5000 and try again.');
-      }
-
-      setLoading(false);
     };
 
-    fetchScreeningResults();
+    void fetchScreeningResults();
+    return () => {
+      canceled = true;
+    };
   }, [selectedBroker, refreshToken, retryTick, appliedFilters]);
 
   const applyPreset = (nextPreset: string) => {

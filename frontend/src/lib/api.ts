@@ -1,6 +1,19 @@
 import axios from 'axios';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api';
+const resolveApiBase = () => {
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+
+  if (typeof window !== 'undefined') {
+    const { protocol, hostname } = window.location;
+    return `${protocol}//${hostname}:5000/api`;
+  }
+
+  return 'http://localhost:5000/api';
+};
+
+const API_BASE = resolveApiBase();
 
 export const api = axios.create({
   baseURL: API_BASE,
@@ -99,6 +112,7 @@ export const brokerApi = {
 export const statusApi = {
   getBrokerStatus: () => api.get('/status/broker'),
   getHealth: () => api.get('/status/health'),
+  getHealthCounters: () => api.get('/status/health/counters'),
 };
 
 export const botApi = {

@@ -2,7 +2,7 @@
 Abstract base broker interface for API agnostic trading.
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -42,7 +42,11 @@ class AccountSnapshot:
     buying_power: float
     total_pnl: float
     total_pnl_pct: float
-    positions: List[Position]
+    positions: List[Position] = field(default_factory=list)
+    realized_pnl: float = 0.0
+    realized_pnl_pct: float = 0.0
+    unrealized_pnl: float = 0.0
+    unrealized_pnl_pct: float = 0.0
     daily_pnl: float = 0.0
     daily_pnl_pct: float = 0.0
     currency: str = "USD"

@@ -23,6 +23,7 @@ export default function Navbar() {
   const [botLastRun, setBotLastRun] = useState<string | null>(null);
   const [botLatestEvent, setBotLatestEvent] = useState('No activity yet');
   const [botLatestEventAt, setBotLatestEventAt] = useState<string | null>(null);
+  const [healthCounters, setHealthCounters] = useState<any>(null);
   const [forexGridStats, setForexGridStats] = useState({
     pairs_configured: 0,
     open_longs: 0,
@@ -56,7 +57,7 @@ export default function Navbar() {
         setBackendOnline(healthy);
 
         if (!healthy) {
-          setBrokerName('DEMO');
+          setBrokerName('IBKR');
           setBrokerConnected(false);
           setExecutionMode('manual');
           setBotRunning(false);
@@ -80,11 +81,12 @@ export default function Navbar() {
           botApi.getStatus(),
           botApi.getLogs(1),
         ]);
+        const countersRes = await statusApi.getHealthCounters().catch(() => null);
 
-        setBrokerName((brokerRes.data.broker || 'DEMO').toUpperCase());
+        setBrokerName((brokerRes.data.broker || 'IBKR').toUpperCase());
         setBrokerConnected(Boolean(brokerRes.data.connected));
-        const brokerLabel = String(brokerRes.data?.broker || 'demo').toLowerCase();
-        const normalized = brokerLabel.includes('ibkr') ? 'ibkr' : brokerLabel.includes('alpaca') ? 'alpaca' : 'ibkr';
+        const brokerLabel = String(brokerRes.data?.broker || 'ibkr').toLowerCase();
+        const normalized = brokerLabel.includes('alpaca') ? 'alpaca' : 'ibkr';
         setSelectedBroker(normalized);
         setExecutionMode((botRes.data.execution_mode || 'manual') as 'manual' | 'automatic');
         setBotRunning(Boolean(botRes.data.bot_running));
@@ -103,9 +105,10 @@ export default function Navbar() {
           setBotLatestEvent(String(latest.event));
           setBotLatestEventAt(latest.timestamp || null);
         }
+        setHealthCounters(countersRes?.data || null);
       } catch {
         setBackendOnline(false);
-        setBrokerName('DEMO');
+        setBrokerName('IBKR');
         setBrokerConnected(false);
         setExecutionMode('manual');
         setBotRunning(false);
@@ -121,6 +124,7 @@ export default function Navbar() {
         setStrategyAudit({});
         setBotLatestEvent('Bot activity unavailable');
         setBotLatestEventAt(null);
+        setHealthCounters(null);
       }
     };
 
@@ -129,7 +133,7 @@ export default function Navbar() {
     return () => clearInterval(interval);
   }, [setSelectedBroker]);
 
-  const handleDataSourceSwitch = async (target: 'demo' | 'ibkr' | 'alpaca') => {
+  const handleDataSourceSwitch = async (target: 'ibkr' | 'alpaca') => {
     if (!backendOnline) {
       setBrokerSwitchError('Backend API is offline. Start backend first.');
       return;
@@ -172,8 +176,11 @@ export default function Navbar() {
 
     setBotLoading(true);
     try {
-      const autoStart = mode === 'automatic';
-      const response = await botApi.setMode(mode, autoStart, 60);
+      if (mode === 'automatic') {
+        await botApi.setExecutionSafety(false);
+      }
+
+      await botApi.setMode(mode, mode === 'automatic', 60);
       const statusRes = await botApi.getStatus();
       setExecutionMode((statusRes.data.execution_mode || mode) as 'manual' | 'automatic');
       setBotRunning(Boolean(statusRes.data.bot_running));
@@ -193,7 +200,8 @@ export default function Navbar() {
   if (!account) return null;
 
   const pnlColor = account.total_pnl >= 0 ? 'text-profit' : 'text-loss';
-  const todayColor = account.daily_pnl >= 0 ? 'text-profit' : 'text-loss';
+  const realizedColor = Number(account.realized_pnl || 0) >= 0 ? 'text-profit' : 'text-loss';
+  const unrealizedColor = Number(account.unrealized_pnl || 0) >= 0 ? 'text-profit' : 'text-loss';
   const accountCurrency = String(account.currency || 'USD').toUpperCase();
   const currencyPrefix = accountCurrency === 'HKD' ? 'HK$' : '$';
   const activityText = String(botLatestEvent || '').toLowerCase();
@@ -215,6 +223,14 @@ export default function Navbar() {
         ? 'text-emerald-200'
         : 'text-slate-100';
   const gridPnlClass = forexGridStats.realized_pnl >= 0 ? 'text-profit' : 'text-loss';
+  const healthSummary = healthCounters?.summary || {};
+  const totalRequests = Number(healthSummary.total_requests ?? 0);
+  const totalErrors = Number(healthSummary.total_errors ?? 0);
+  const avgLatencyMs = Number(healthSummary.avg_latency_ms ?? 0);
+  const maxLatencyMs = Number(healthSummary.max_latency_ms ?? 0);
+  const healthBadgeClass = totalErrors > 0
+    ? 'border-amber-500/60 bg-amber-900/25 text-amber-100'
+    : 'border-emerald-500/60 bg-emerald-900/25 text-emerald-100';
   const blowupExecution = String(strategyAudit?.blowup?.execution || 'idle').toLowerCase();
   const coveredCallExecution = String(strategyAudit?.covered_call?.execution || 'idle').toLowerCase();
   const forexExecution = String(strategyAudit?.forex_grid?.execution || 'idle').toLowerCase();
@@ -287,10 +303,16 @@ export default function Navbar() {
                   {currencyPrefix}{Number(account.total_pnl || 0).toLocaleString()} ({Number(account.total_pnl_pct || 0).toFixed(2)}%)
                 </p>
               </div>
-              <div className="rounded-lg border border-slate-600/50 bg-slate-900/35 px-3 py-1.5 min-w-[140px]">
-                <p className="text-[10px] uppercase tracking-wide text-slate-400">Today</p>
-                <p className={`text-lg font-semibold ${todayColor}`}>
-                  {currencyPrefix}{Number(account.daily_pnl || 0).toLocaleString()}
+              <div className="rounded-lg border border-slate-600/50 bg-slate-900/35 px-3 py-1.5 min-w-[190px]">
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">Realized P&L</p>
+                <p className={`text-lg font-semibold ${realizedColor}`}>
+                  {currencyPrefix}{Number(account.realized_pnl || 0).toLocaleString()} ({Number(account.realized_pnl_pct || 0).toFixed(2)}%)
+                </p>
+              </div>
+              <div className="rounded-lg border border-slate-600/50 bg-slate-900/35 px-3 py-1.5 min-w-[200px]">
+                <p className="text-[10px] uppercase tracking-wide text-slate-400">Unrealized P&L</p>
+                <p className={`text-lg font-semibold ${unrealizedColor}`}>
+                  {currencyPrefix}{Number(account.unrealized_pnl || 0).toLocaleString()} ({Number(account.unrealized_pnl_pct || 0).toFixed(2)}%)
                 </p>
               </div>
             </div>
@@ -314,7 +336,7 @@ export default function Navbar() {
             ].map((item) => (
               <button
                 key={item.id}
-                onClick={() => handleDataSourceSwitch(item.id as 'demo' | 'ibkr' | 'alpaca')}
+                onClick={() => handleDataSourceSwitch(item.id as 'ibkr' | 'alpaca')}
                 disabled={switchingBroker || !backendOnline}
                 className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
                   selectedBroker === item.id
@@ -328,28 +350,28 @@ export default function Navbar() {
 
             <div className="inline-flex items-center gap-2 rounded-full border border-slate-600/70 bg-slate-900/45 px-2 py-1">
               <span className="inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-slate-300 px-1">
-                <Bot size={12} /> Bot
+                  <Bot size={12} /> Bot Power
               </span>
               <div className="flex items-center gap-1.5">
-                <span className={`text-[10px] font-semibold ${executionMode === 'manual' ? 'text-teal-100' : 'text-slate-400'}`}>M</span>
+                  <span className={`text-[10px] font-semibold ${executionMode === 'automatic' && botRunning ? 'text-slate-400' : 'text-teal-100'}`}>Off</span>
                 <button
                   onClick={handleNavToggle}
                   role="switch"
-                  aria-checked={executionMode === 'automatic'}
+                    aria-checked={executionMode === 'automatic' && botRunning}
                   disabled={botLoading || !backendOnline}
                   className={`relative h-5 w-10 shrink-0 rounded-full border transition-all duration-300 ease-out ${
-                    executionMode === 'automatic'
+                      executionMode === 'automatic' && botRunning
                       ? 'border-emerald-400/70 bg-emerald-500/30'
                       : 'border-slate-500/70 bg-slate-700/50'
                   } ${botLoading || !backendOnline ? 'opacity-70 cursor-not-allowed' : 'hover:brightness-110'}`}
                 >
                   <span
                     className={`absolute left-[2px] top-[2px] h-3 w-3 rounded-full bg-white shadow-md transition-transform duration-300 ease-out ${
-                      executionMode === 'automatic' ? 'translate-x-5' : 'translate-x-0'
+                        executionMode === 'automatic' && botRunning ? 'translate-x-5' : 'translate-x-0'
                     }`}
                   />
                 </button>
-                <span className={`text-[10px] font-semibold ${executionMode === 'automatic' ? 'text-teal-100' : 'text-slate-400'}`}>A</span>
+                  <span className={`text-[10px] font-semibold ${executionMode === 'automatic' && botRunning ? 'text-teal-100' : 'text-slate-400'}`}>On</span>
               </div>
               <span className={`text-[11px] font-semibold ${botRunning ? 'text-profit' : 'text-loss'}`}>
                 {botRunning ? 'Running' : 'Stopped'}
@@ -364,6 +386,10 @@ export default function Navbar() {
               {engineLabel}
             </button>
 
+            <span className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${healthBadgeClass}`} title={healthSummary.total_requests ? `Max latency ${maxLatencyMs.toFixed(1)}ms` : 'Health counters unavailable yet'}>
+              Ops {totalRequests} req / {totalErrors} err / {avgLatencyMs.toFixed(1)}ms avg
+            </span>
+
             <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${activityContainerClass}`}>
               <span className={`font-semibold ${activityTextClass}`}>{botLatestEvent}</span>
               <span className="text-slate-300">{botLatestEventAt ? `${getHeartbeatAge(botLatestEventAt)} ago` : 'Waiting'}</span>
@@ -374,6 +400,10 @@ export default function Navbar() {
               <span className={gridPnlClass}>{forexGridStats.realized_pnl >= 0 ? '+' : ''}{forexGridStats.realized_pnl.toFixed(2)}</span>
               <span className="text-slate-300">{getHeartbeatAge(forexGridStats.last_cycle)} ago</span>
             </div>
+
+            <span className="inline-flex items-center rounded-full border border-slate-600/70 bg-slate-900/45 px-3 py-1 text-xs text-slate-300">
+              Max {maxLatencyMs.toFixed(1)}ms | Health {totalErrors === 0 ? 'clean' : 'watch'}
+            </span>
 
             {backendOnline && (
               <span className="inline-flex items-center rounded-full border border-slate-600/70 bg-slate-900/45 px-3 py-1 text-xs text-slate-300">

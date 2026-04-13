@@ -1,40 +1,49 @@
 {
-  "mode": "forex_focused",
   "allocation": {
-    "blowup_stocks_pct": 20.0,
-    "covered_calls_pct": 20.0,
-    "forex_pct": 60.0
+    "blowup_stocks_pct": 20,
+    "covered_calls_pct": 20,
+    "forex_pct": 60
+  },
+  "crypto": {
+    "advanced_user_confirmed": true,
+    "enabled": true,
+    "risk_acknowledged": true,
+    "symbols": [
+      "BTC-USD",
+      "ETH-USD"
+    ]
+  },
+  "forex": {
+    "grid_max_legs_per_pair": 3,
+    "grid_step_pct": 0.0015,
+    "grid_take_profit_steps": 1,
+    "leverage": 1,
+    "max_position_size_pct": 5,
+    "pairs": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY"
+    ],
+    "tick_seconds": 1
   },
   "fundamental_screener": {
-    "relative_volume_threshold": 2.0,
-    "pe_ratio_max": 30.0,
-    "forward_pe_ratio_max": 25.0,
-    "price_min": 5.0,
-    "price_max": 500.0,
-    "market_cap_min_millions": 100.0
+    "forward_pe_ratio_max": 25,
+    "market_cap_min_millions": 100,
+    "pe_ratio_max": 30,
+    "price_max": 500,
+    "price_min": 5,
+    "relative_volume_threshold": 2
   },
+  "mode": "forex_focused",
   "option_screener": {
+    "dte_target": 0,
+    "min_premium_pct": 0.5,
     "symbols": [
       "SPY",
       "QQQ",
       "IWM",
       "UVXY"
     ],
-    "target_delta": 0.25,
-    "min_premium_pct": 0.5,
-    "dte_target": 0
-  },
-  "forex": {
-    "pairs": [
-      "EURUSD",
-      "GBPUSD",
-      "USDJPY"
-    ],
-    "leverage": 1.0,
-    "max_position_size_pct": 5.0,
-    "tick_seconds": 1,
-    "grid_step_pct": 0.0015,
-    "grid_max_legs_per_pair": 3,
-    "grid_take_profit_steps": 1
+    "target_delta": 0.25
   }
 }

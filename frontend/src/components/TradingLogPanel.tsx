@@ -278,9 +278,7 @@ export default function TradingLogPanel() {
               {!loading && filteredLogs.length === 0 && (
                 <tr>
                   <td colSpan={13} className="px-4 py-8 text-center text-slate-300">
-                    {source === 'demo'
-                      ? 'No trade logs found for current filters.'
-                      : `No ${source.toUpperCase()} fills found for current filters yet. Place a small paper trade to verify live logging.`}
+                    {`No ${source.toUpperCase()} fills found for current filters yet. Place a small paper trade to verify live logging.`}
                   </td>
                 </tr>
               )}

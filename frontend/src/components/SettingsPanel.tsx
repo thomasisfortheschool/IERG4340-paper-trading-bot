@@ -2,7 +2,8 @@
 
 import { useState, useEffect } from 'react';
 import { useTradingStore } from '@/store';
-import { botApi, brokerApi, configApi, statusApi } from '@/lib/api';
+import { accountApi, botApi, brokerApi, configApi, statusApi } from '@/lib/api';
+import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
 import { Activity, AlertTriangle, Bot, SlidersHorizontal, Sparkles, Wallet } from 'lucide-react';
 
 export default function SettingsPanel() {
@@ -27,6 +28,7 @@ export default function SettingsPanel() {
   const [botCycleCount, setBotCycleCount] = useState(0);
   const [botLastRun, setBotLastRun] = useState<string | null>(null);
   const [botLastError, setBotLastError] = useState<string | null>(null);
+  const [positionsSnapshot, setPositionsSnapshot] = useState<any[]>([]);
   const [settingsConfig, setSettingsConfig] = useState<any>(null);
   const [cryptoEnabled, setCryptoEnabled] = useState(false);
   const [cryptoSymbolsInput, setCryptoSymbolsInput] = useState('BTC-USD, ETH-USD');
@@ -52,7 +54,7 @@ export default function SettingsPanel() {
     let mounted = true;
 
     const loadSettings = async () => {
-      const [currentResult, presetsResult, brokerResult, botResult, healthResult] = await Promise.allSettled([
+      const [currentResult, presetsResult, brokerResult, capabilitiesResult, botResult, healthResult] = await Promise.allSettled([
         configApi.getCurrent(),
         configApi.getPresets(),
         brokerApi.getOptions(),
@@ -84,12 +86,16 @@ export default function SettingsPanel() {
 
       if (brokerResult.status === 'fulfilled') {
         const brokerData = brokerResult.value.data || {};
-        setSelectedBroker(brokerData.current || 'demo');
+        setSelectedBroker((brokerData.current || 'ibkr') as 'ibkr' | 'alpaca');
         setBrokerRuntimeConfig(brokerData.active_config || {});
         setBrokerCapabilities(brokerData.capabilities || null);
         setBrokerStatus(
-          brokerData.connected ? `Connected to ${String(brokerData.current || 'demo').toUpperCase()}` : 'Demo mode active'
+          brokerData.connected ? `Connected to ${String(brokerData.current || 'ibkr').toUpperCase()}` : 'Broker disconnected'
         );
+      }
+
+      if (capabilitiesResult.status === 'fulfilled') {
+        setBrokerCapabilities(capabilitiesResult.value.data || null);
       }
 
       if (botResult.status === 'fulfilled') {
@@ -101,7 +107,7 @@ export default function SettingsPanel() {
         setBotLastError(botData.bot_last_error ?? null);
       }
 
-      setBackendOnline(healthResult.status === 'fulfilled');
+      setBackendOnline(healthResult.status === 'fulfilled' && healthResult.value?.data?.status === 'healthy');
     };
 
     void loadSettings();
@@ -110,6 +116,45 @@ export default function SettingsPanel() {
       mounted = false;
     };
   }, [setConfig, setCurrentMode]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const syncRuntimeStatus = async () => {
+      const [botResult, healthResult, positionsResult] = await Promise.allSettled([
+        botApi.getStatus(),
+        statusApi.getHealth(),
+        accountApi.getPositions(),
+      ]);
+
+      if (!mounted) return;
+
+      if (botResult.status === 'fulfilled') {
+        const botData = botResult.value.data || {};
+        setExecutionMode(botData.execution_mode ?? 'manual');
+        setBotRunning(Boolean(botData.bot_running));
+        setBotCycleCount(Number(botData.bot_cycle_count ?? 0));
+        setBotLastRun(botData.bot_last_run ?? null);
+        setBotLastError(botData.bot_last_error ?? null);
+      }
+
+      if (positionsResult.status === 'fulfilled') {
+        setPositionsSnapshot(positionsResult.value.data?.positions || []);
+      }
+
+      setBackendOnline(healthResult.status === 'fulfilled' && healthResult.value?.data?.status === 'healthy');
+    };
+
+    void syncRuntimeStatus();
+    const interval = setInterval(() => {
+      void syncRuntimeStatus();
+    }, 5000);
+
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   useEffect(() => {
     const nextCrypto = (settingsConfig ?? config)?.crypto ?? {};
@@ -229,14 +274,10 @@ export default function SettingsPanel() {
       const response = await brokerApi.switch(selectedBroker, selectedBroker === 'ibkr' ? brokerRuntimeConfig : {});
       const capabilityResponse = await brokerApi.getCapabilities();
       const nextBroker = response.data?.broker || selectedBroker;
-      setSelectedBroker(nextBroker);
+      setSelectedBroker((nextBroker || 'ibkr') as 'ibkr' | 'alpaca');
       setBrokerRuntimeConfig(response.data?.config || {});
       setBrokerCapabilities(capabilityResponse.data || null);
-      setBrokerStatus(
-        nextBroker === 'demo'
-          ? 'Switched to demo mode'
-          : `Switched to ${String(nextBroker).toUpperCase()} paper trading`
-      );
+      setBrokerStatus(`Switched to ${String(nextBroker).toUpperCase()} paper trading`);
       setBackendOnline(true);
     } catch (error: any) {
       setBrokerStatus(error?.response?.data?.error || error?.message || 'Broker switch failed');
@@ -245,35 +286,34 @@ export default function SettingsPanel() {
     }
   };
 
-  const handleExecutionModeChange = async (mode: 'manual' | 'automatic') => {
+  const handleBotPowerToggle = async () => {
     setBotLoading(true);
     try {
-      const response = await botApi.setMode(mode, mode === 'automatic', botIntervalSeconds);
-      setExecutionMode(response.data?.execution_mode || mode);
-      setBotRunning(Boolean(response.data?.bot_running));
-      setBotStatusMessage(`Execution mode set to ${mode}`);
+      const isCurrentlyOn = executionMode === 'automatic' && botRunning;
+
+      if (isCurrentlyOn) {
+        await botApi.stop();
+        await botApi.setMode('manual', false, botIntervalSeconds);
+        setExecutionMode('manual');
+        setBotRunning(false);
+        setBotStatusMessage('Bot turned off. Automatic execution stopped.');
+      } else {
+        await botApi.setExecutionSafety(false);
+        await botApi.setMode('automatic', true, botIntervalSeconds);
+        setBotStatusMessage('Bot turned on. Live paper execution started immediately.');
+      }
+
+      const latest = await botApi.getStatus().catch(() => null);
+      if (latest?.data) {
+        setExecutionMode(latest.data.execution_mode ?? 'manual');
+        setBotRunning(Boolean(latest.data.bot_running));
+        setBotCycleCount(Number(latest.data.bot_cycle_count ?? 0));
+        setBotLastRun(latest.data.bot_last_run ?? null);
+        setBotLastError(latest.data.bot_last_error ?? null);
+      }
       setBackendOnline(true);
     } catch (error: any) {
-      setBotStatusMessage(error?.response?.data?.error || error?.message || 'Failed to set execution mode');
-    } finally {
-      setBotLoading(false);
-    }
-  };
-
-  const handleBotStartStop = async () => {
-    setBotLoading(true);
-    try {
-      if (botRunning) {
-        await botApi.stop();
-        setBotRunning(false);
-        setBotStatusMessage('Bot stopped');
-      } else {
-        const response = await botApi.start(botIntervalSeconds);
-        setBotRunning(Boolean(response.data?.bot_running));
-        setBotStatusMessage('Bot started');
-      }
-    } catch (error: any) {
-      setBotStatusMessage(error?.response?.data?.error || error?.message || 'Failed to update bot runner');
+      setBotStatusMessage(error?.response?.data?.error || error?.message || 'Failed to toggle bot power');
     } finally {
       setBotLoading(false);
     }
@@ -392,6 +432,48 @@ export default function SettingsPanel() {
     </div>
   );
 
+  const sleeveStats = positionsSnapshot.reduce(
+    (acc, pos) => {
+      const asset = String(pos?.asset_type || 'stock').toLowerCase();
+      const notional = Math.abs(Number(pos?.current_price || 0) * Number(pos?.quantity || 0));
+      if (asset === 'option') {
+        acc.options.count += 1;
+        acc.options.notional += notional;
+      } else if (asset === 'forex') {
+        acc.forex.count += 1;
+        acc.forex.notional += notional;
+      } else if (asset === 'crypto') {
+        acc.crypto.count += 1;
+        acc.crypto.notional += notional;
+      } else {
+        acc.stocks.count += 1;
+        acc.stocks.notional += notional;
+      }
+      return acc;
+    },
+    {
+      stocks: { count: 0, notional: 0 },
+      options: { count: 0, notional: 0 },
+      forex: { count: 0, notional: 0 },
+      crypto: { count: 0, notional: 0 },
+    }
+  );
+
+  const allocationPieData = [
+    { name: 'Stocks', value: Math.max(0, Number(customAllocation.blowup_stocks_pct || 0)), color: '#22d3ee' },
+    { name: 'Options', value: Math.max(0, Number(customAllocation.covered_calls_pct || 0)), color: '#fbbf24' },
+    {
+      name: 'Forex',
+      value: Math.max(0, Number(customAllocation.forex_pct || 0)) * (cryptoEnabled ? 0.7 : 1.0),
+      color: '#34d399',
+    },
+    {
+      name: 'Crypto',
+      value: cryptoEnabled ? Math.max(0, Number(customAllocation.forex_pct || 0)) * 0.3 : 0,
+      color: '#fb7185',
+    },
+  ].filter((row) => row.value > 0);
+
   return (
     <>
       <div className="grid gap-5 xl:grid-cols-12 xl:items-start">
@@ -430,6 +512,35 @@ export default function SettingsPanel() {
               <div className="flex items-center gap-3 mb-4">
                 <Wallet className="text-teal-300" size={20} />
                 <h3 className="text-xl md:text-2xl font-bold">Strategy Allocation</h3>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2 mb-4">
+                <div className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-300 mb-2">Allocation Pie (Configured)</p>
+                  <div className="h-52">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie data={allocationPieData} dataKey="value" nameKey="name" innerRadius={45} outerRadius={75}>
+                          {allocationPieData.map((entry) => (
+                            <Cell key={entry.name} fill={entry.color} />
+                          ))}
+                        </Pie>
+                        <Tooltip formatter={(value: any) => `${Number(value).toFixed(1)}%`} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <p className="text-xs text-slate-400">Crypto allocation is carved from the Forex sleeve when 24/7 crypto is enabled.</p>
+                </div>
+
+                <div className="rounded-xl border border-slate-600/60 bg-slate-900/35 p-3">
+                  <p className="text-xs uppercase tracking-wide text-slate-300 mb-2">Live Sleeve Exposure</p>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex items-center justify-between"><span>Stocks</span><span className="text-slate-100">{sleeveStats.stocks.count > 0 ? `${sleeveStats.stocks.count} positions` : 'No positions'}</span></div>
+                    <div className="flex items-center justify-between"><span>Options</span><span className="text-slate-100">{sleeveStats.options.count > 0 ? `${sleeveStats.options.count} positions` : 'No positions'}</span></div>
+                    <div className="flex items-center justify-between"><span>Forex</span><span className="text-slate-100">{sleeveStats.forex.count > 0 ? `${sleeveStats.forex.count} positions` : 'No positions'}</span></div>
+                    <div className="flex items-center justify-between"><span>Crypto</span><span className="text-slate-100">{sleeveStats.crypto.count > 0 ? `${sleeveStats.crypto.count} positions` : 'No positions'}</span></div>
+                  </div>
+                </div>
               </div>
 
               <div className="mb-5 overflow-hidden rounded-xl border border-slate-600/60 h-4 bg-slate-900/40 flex">
@@ -516,12 +627,11 @@ export default function SettingsPanel() {
               <div className="space-y-2">
                 <select
                   value={selectedBroker}
-                  onChange={(e) => setSelectedBroker(e.target.value)}
+                  onChange={(e) => setSelectedBroker(e.target.value as 'ibkr' | 'alpaca')}
                   className="input-modern"
                 >
                   <option value="ibkr">IBKR Paper Trading</option>
                   <option value="alpaca">Alpaca Paper Trading</option>
-                  <option value="demo">Demo / Mock Data</option>
                 </select>
                 <button
                   onClick={handleBrokerSwitch}
@@ -568,35 +678,35 @@ export default function SettingsPanel() {
             <section className="card space-y-4">
               <div className="flex items-center gap-3 mb-2.5">
                 <Bot className="text-teal-300" size={20} />
-                <h3 className="text-xl font-bold">Execution Mode</h3>
+                <h3 className="text-xl font-bold">Bot Power</h3>
               </div>
 
               <div className="mb-2 rounded-xl border border-slate-600/70 bg-slate-900/35 p-2.5">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold text-slate-100">Manual / Automatic</p>
-                    <p className="text-xs text-slate-300">Toggle to switch execution mode</p>
+                    <p className="text-sm font-semibold text-slate-100">Bot Power</p>
+                    <p className="text-xs text-slate-300">Toggle ON to start automatic live execution immediately</p>
                   </div>
                   <div className="flex items-center gap-3">
-                    <span className={`text-xs font-semibold shrink-0 ${executionMode === 'manual' ? 'text-teal-100' : 'text-slate-400'}`}>Manual</span>
+                    <span className={`text-xs font-semibold shrink-0 ${executionMode === 'automatic' && botRunning ? 'text-slate-400' : 'text-teal-100'}`}>Off</span>
                     <button
-                      onClick={() => handleExecutionModeChange(executionMode === 'manual' ? 'automatic' : 'manual')}
+                      onClick={handleBotPowerToggle}
                       role="switch"
-                      aria-checked={executionMode === 'automatic'}
+                      aria-checked={executionMode === 'automatic' && botRunning}
                       disabled={botLoading || !backendOnline}
                       className={`relative h-8 w-16 shrink-0 rounded-full border transition-all duration-300 ease-out ${
-                        executionMode === 'automatic'
+                        executionMode === 'automatic' && botRunning
                           ? 'border-emerald-400/70 bg-emerald-500/30'
                           : 'border-slate-500/70 bg-slate-700/50'
                       } ${botLoading || !backendOnline ? 'opacity-70 cursor-not-allowed' : 'hover:brightness-110'}`}
                     >
                       <span
                         className={`absolute left-1 top-1 h-6 w-6 rounded-full bg-white shadow-md transition-transform duration-300 ease-out ${
-                          executionMode === 'automatic' ? 'translate-x-8' : 'translate-x-0'
+                          executionMode === 'automatic' && botRunning ? 'translate-x-8' : 'translate-x-0'
                         }`}
                       />
                     </button>
-                    <span className={`text-xs font-semibold shrink-0 ${executionMode === 'automatic' ? 'text-teal-100' : 'text-slate-400'}`}>Automatic</span>
+                    <span className={`text-xs font-semibold shrink-0 ${executionMode === 'automatic' && botRunning ? 'text-teal-100' : 'text-slate-400'}`}>On</span>
                   </div>
                 </div>
               </div>
@@ -613,17 +723,13 @@ export default function SettingsPanel() {
                 />
               </div>
 
-              <button
-                onClick={handleBotStartStop}
-                disabled={botLoading || executionMode !== 'automatic' || !backendOnline}
-                className="btn-primary w-full disabled:opacity-50"
-              >
-                {botLoading ? 'Working...' : botRunning ? 'Stop Bot' : 'Start Bot'}
-              </button>
+              <p className="text-xs text-slate-300 mt-1">
+                Turning ON sets automatic mode and live paper execution together.
+              </p>
 
               <div className="mt-2 text-xs text-slate-300 space-y-1 leading-snug">
                 <p>Backend: <span className={backendOnline ? 'text-profit' : 'text-loss'}>{backendOnline ? 'Online' : 'Offline'}</span></p>
-                <p>Mode: <span className="text-slate-100 uppercase">{executionMode}</span></p>
+                <p>Power State: <span className="text-slate-100 uppercase">{executionMode === 'automatic' && botRunning ? 'ON' : 'OFF (manual data mode)'}</span></p>
                 <p>Runner: <span className={botRunning ? 'text-profit' : 'text-loss'}>{botRunning ? 'Running' : 'Stopped'}</span></p>
                 <p>Cycles: <span className="text-slate-100">{botCycleCount}</span></p>
                 <p>Last Run: <span className="text-slate-100">{botLastRun ? new Date(botLastRun).toLocaleString() : 'N/A'}</span></p>
@@ -632,7 +738,7 @@ export default function SettingsPanel() {
               </div>
 
               {botStatusMessage && <p className="text-sm text-slate-100 mt-2">{botStatusMessage}</p>}
-              <p className="text-xs text-slate-300 mt-2">Manual mode only provides data/screening. Automatic mode enables bot cycles and live trading.</p>
+              <p className="text-xs text-slate-300 mt-2">Bot OFF keeps data and screening available. Bot ON runs automatic live-paper cycles.</p>
             </section>
 
             <section className="card space-y-4 border border-red-500/40 bg-gradient-to-br from-red-950/40 via-slate-900/60 to-slate-950/70">

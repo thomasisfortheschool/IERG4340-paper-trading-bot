@@ -2,14 +2,13 @@
 
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
-export default function PortfolioChart({ history, source = 'demo' }: { history: any[]; source?: string }) {
+export default function PortfolioChart({ history, source = 'ibkr' }: { history: any[]; source?: string }) {
   if (!history || history.length === 0) {
     return <div className="card text-center text-slate-300">No portfolio history available yet.</div>;
   }
 
-  const normalizedSource = String(source || 'demo').toLowerCase();
-  const isLiveSource = normalizedSource !== 'demo';
-  const sourceLabel = isLiveSource ? `Live ${normalizedSource.toUpperCase()} (positions-based)` : 'Demo simulated';
+  const normalizedSource = String(source || 'ibkr').toLowerCase();
+  const sourceLabel = `Broker ${normalizedSource.toUpperCase()} (positions-based)`;
 
   const start = Number(history[0]?.cumulative_pnl ?? 0);
   const end = Number(history[history.length - 1]?.cumulative_pnl ?? 0);
@@ -35,7 +34,7 @@ export default function PortfolioChart({ history, source = 'demo' }: { history: 
         <div className="flex items-center justify-between gap-3 mb-1">
           <h2 className="text-xl md:text-2xl font-bold">Cumulative P&L</h2>
           <div className="flex flex-wrap items-center justify-end gap-2">
-            <span className={`rounded-full px-3 py-1 text-xs font-semibold border ${isLiveSource ? 'text-cyan-200 border-cyan-400/50 bg-cyan-900/30' : 'text-slate-200 border-slate-500/40 bg-slate-800/60'}`}>
+            <span className="rounded-full px-3 py-1 text-xs font-semibold border text-cyan-200 border-cyan-400/50 bg-cyan-900/30">
               {sourceLabel}
             </span>
             <span className={`rounded-full px-3 py-1 text-xs font-semibold border ${isUp ? 'text-profit border-emerald-400/50 bg-emerald-900/35' : 'text-loss border-rose-400/50 bg-rose-900/35'}`}>
@@ -44,7 +43,7 @@ export default function PortfolioChart({ history, source = 'demo' }: { history: 
           </div>
         </div>
         <p className="text-sm text-slate-300 mb-4">
-          {isLiveSource ? 'Last 30 trading days from broker account and position marks' : 'Last 30 trading days (simulated demo series)'}
+          Last 30 trading days from broker account and position marks
         </p>
         <ResponsiveContainer width="100%" height={300}>
           <LineChart data={history}>

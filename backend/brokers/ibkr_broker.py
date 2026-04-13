@@ -4,7 +4,7 @@ Supports paper trading API for demo purposes.
 """
 import asyncio
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import re
 
@@ -79,6 +79,8 @@ class IBKRBroker(BaseBroker):
             total_pnl = realized + unrealized
             base_capital = max(total_value - total_pnl, 1e-9)
             total_pnl_pct = (total_pnl / base_capital) * 100 if total_pnl != 0 else 0
+            realized_pct = (realized / base_capital) * 100 if realized != 0 else 0
+            unrealized_pct = (unrealized / base_capital) * 100 if unrealized != 0 else 0
             
             return AccountSnapshot(
                 total_value=total_value,
@@ -86,12 +88,16 @@ class IBKRBroker(BaseBroker):
                 buying_power=buying_power,
                 total_pnl=total_pnl,
                 total_pnl_pct=total_pnl_pct,
+                realized_pnl=realized,
+                realized_pnl_pct=realized_pct,
+                unrealized_pnl=unrealized,
+                unrealized_pnl_pct=unrealized_pct,
                 positions=positions,
                 currency=("HKD" if display_currency == "BASE" and "HKD" in currencies else display_currency),
             )
         except Exception as e:
             logger.error(f"Failed to get account snapshot: {e}")
-            return AccountSnapshot(0, 0, 0, 0, 0, [])
+            return AccountSnapshot(0, 0, 0, 0, 0, positions=[])
     
     async def get_positions(self) -> List[Position]:
         """Get list of open positions."""
@@ -101,15 +107,19 @@ class IBKRBroker(BaseBroker):
             
             for pos in positions:
                 contract = pos.contract
-                current_price = self._get_market_price(contract)
-                
-                pnl = pos.marketValue - (pos.avgCost * pos.position)
-                pnl_pct = (pnl / (pos.avgCost * pos.position)) * 100 if pos.avgCost > 0 else 0
+                qty = float(getattr(pos, "position", 0.0) or 0.0)
+                avg_price = float(getattr(pos, "avgCost", 0.0) or 0.0)
+                # IB position objects do not expose marketValue consistently; compute from latest mid when available.
+                current_price = await self._get_market_price(contract)
+                basis = avg_price * qty
+                market_value = current_price * qty if current_price > 0 else basis
+                pnl = market_value - basis
+                pnl_pct = (pnl / abs(basis)) * 100 if basis else 0
                 
                 position = Position(
                     symbol=contract.symbol,
-                    quantity=pos.position,
-                    avg_price=pos.avgCost,
+                    quantity=qty,
+                    avg_price=avg_price,
                     current_price=current_price,
                     pnl=pnl,
                     pnl_pct=pnl_pct,
@@ -135,7 +145,9 @@ class IBKRBroker(BaseBroker):
         """Place a market or limit order."""
         try:
             contract = Stock(symbol, "SMART", "USD")
-            self.ib.qualifyContracts(contract)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
             
             if order_type == "market":
                 order = self.ib.placeOrder(contract, MarketOrder(side.upper(), quantity))
@@ -196,7 +208,32 @@ class IBKRBroker(BaseBroker):
             if qualified:
                 contract = qualified[0]
 
-            trade = self.ib.placeOrder(contract, MarketOrder(side.upper(), float(quantity)))
+            side_upper = side.upper()
+            if side_upper == "BUY":
+                # IBKR crypto market buys require cashQty in quote currency (USD).
+                notional_usd = 0.0
+                try:
+                    tickers = await self.ib.reqTickersAsync(contract)
+                    if tickers:
+                        t = tickers[0]
+                        bid = float(getattr(t, "bid", 0.0) or 0.0)
+                        ask = float(getattr(t, "ask", 0.0) or 0.0)
+                        last = float(getattr(t, "last", 0.0) or 0.0)
+                        px = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+                        if px > 0:
+                            notional_usd = float(quantity) * px
+                except Exception:
+                    notional_usd = 0.0
+
+                if notional_usd <= 0:
+                    # Fallback interprets quantity as a USD notional when price is unavailable.
+                    notional_usd = float(quantity)
+
+                order = MarketOrder(side_upper, 0)
+                order.cashQty = round(max(notional_usd, 10.0), 2)
+                trade = self.ib.placeOrder(contract, order)
+            else:
+                trade = self.ib.placeOrder(contract, MarketOrder(side_upper, float(quantity)))
             return Order(
                 order_id=str(trade.order.orderId),
                 symbol=normalized,
@@ -228,7 +265,9 @@ class IBKRBroker(BaseBroker):
                 return None
 
             contract = Option(symbol, expiry, float(strike), "C", "SMART")
-            self.ib.qualifyContracts(contract)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
 
             if limit_price is not None and float(limit_price) > 0:
                 ib_order = LimitOrder("SELL", contracts, float(limit_price))
@@ -295,15 +334,24 @@ class IBKRBroker(BaseBroker):
         """Get current market quote."""
         try:
             contract = Stock(symbol, "SMART", "USD")
-            ticker = self.ib.reqMktData(contract, "", snapshot=True)
-            self.ib.sleep(0.5)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
+            tickers = await self.ib.reqTickersAsync(contract)
+            if not tickers:
+                return {}
+            ticker = tickers[0]
+            bid = float(getattr(ticker, "bid", 0.0) or 0.0)
+            ask = float(getattr(ticker, "ask", 0.0) or 0.0)
+            last = float(getattr(ticker, "last", 0.0) or 0.0)
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (last if last > 0 else 0.0)
             
             return {
                 "symbol": symbol,
-                "bid": float(ticker.bid),
-                "ask": float(ticker.ask),
-                "last": float(ticker.last),
-                "mid": (float(ticker.bid) + float(ticker.ask)) / 2,
+                "bid": bid,
+                "ask": ask,
+                "last": last,
+                "mid": mid,
             }
         except Exception as e:
             logger.error(f"Failed to get quote for {symbol}: {e}")
@@ -314,7 +362,10 @@ class IBKRBroker(BaseBroker):
         """Get OHLCV data."""
         try:
             contract = Stock(symbol, "SMART", "USD")
-            bars = self.ib.reqHistoricalData(
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
+            bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",
                 durationStr=f"{lookback_days} D",
@@ -342,7 +393,13 @@ class IBKRBroker(BaseBroker):
         """Get option chain for underlying."""
         try:
             contract = Stock(symbol, "SMART", "USD")
-            chains = self.ib.reqSecDefOptParams(symbol, "", "STK", contract.conId)
+            qualified = await self.ib.qualifyContractsAsync(contract)
+            if qualified:
+                contract = qualified[0]
+            if hasattr(self.ib, "reqSecDefOptParamsAsync"):
+                chains = await self.ib.reqSecDefOptParamsAsync(symbol, "", "STK", contract.conId)
+            else:
+                chains = self.ib.reqSecDefOptParams(symbol, "", "STK", contract.conId)
             
             if not chains:
                 return {}
@@ -379,7 +436,7 @@ class IBKRBroker(BaseBroker):
     async def get_trade_logs(self, days: int = 30, asset_type: str = "all", status: str = "all") -> List[Dict[str, Any]]:
         """Return normalized recent trade logs from IBKR fills."""
         try:
-            since = datetime.now() - timedelta(days=max(1, int(days)))
+            since = datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
             fills = self.ib.fills() or []
             rows: List[Dict[str, Any]] = []
 
@@ -391,7 +448,9 @@ class IBKRBroker(BaseBroker):
                 if execution is None or contract is None:
                     continue
 
-                ts = execution.time if isinstance(execution.time, datetime) else datetime.now()
+                ts = execution.time if isinstance(execution.time, datetime) else datetime.now(timezone.utc)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
                 if ts < since:
                     continue
 
@@ -579,15 +638,28 @@ class IBKRBroker(BaseBroker):
                     continue
         return 0.0
     
-    def _get_market_price(self, contract: Contract) -> float:
+    async def _get_market_price(self, contract: Contract) -> float:
         """Get current market price for a contract."""
         try:
-            ticker = self.ib.reqMktData(contract, "", snapshot=True)
-            self.ib.sleep(0.1)
-            if ticker.bid > 0 and ticker.ask > 0:
-                return (ticker.bid + ticker.ask) / 2
-            return float(ticker.last or 0)
-        except:
+            normalized = contract
+            try:
+                qualified = await self.ib.qualifyContractsAsync(contract)
+                if qualified:
+                    normalized = qualified[0]
+            except Exception:
+                pass
+
+            tickers = await self.ib.reqTickersAsync(normalized)
+            if not tickers:
+                return float(getattr(contract, "strike", 0.0) or 0.0)
+
+            ticker = tickers[0]
+            bid = float(getattr(ticker, "bid", 0.0) or 0.0)
+            ask = float(getattr(ticker, "ask", 0.0) or 0.0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
+            return float(getattr(ticker, "last", 0.0) or 0.0)
+        except Exception:
             return 0.0
     
     def _get_asset_type(self, contract: Contract) -> str:

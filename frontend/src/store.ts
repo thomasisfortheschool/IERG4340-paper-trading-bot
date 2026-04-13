@@ -5,7 +5,7 @@ interface TradingStore {
   positions: any[];
   currentMode: string;
   config: any;
-  selectedBroker: 'demo' | 'ibkr' | 'alpaca';
+  selectedBroker: 'ibkr' | 'alpaca';
   activeTab: string;
   forexAuditFocus: 'all' | 'blowup' | 'covered_call' | 'forex_grid';
   refreshToken: number;
@@ -13,7 +13,7 @@ interface TradingStore {
   setPositions: (positions: any[]) => void;
   setCurrentMode: (mode: string) => void;
   setConfig: (config: any) => void;
-  setSelectedBroker: (broker: 'demo' | 'ibkr' | 'alpaca') => void;
+  setSelectedBroker: (broker: 'ibkr' | 'alpaca') => void;
   setActiveTab: (tab: string) => void;
   setForexAuditFocus: (focus: 'all' | 'blowup' | 'covered_call' | 'forex_grid') => void;
   bumpRefreshToken: () => void;

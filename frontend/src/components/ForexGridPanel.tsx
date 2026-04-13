@@ -2,7 +2,6 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { botApi, configApi, statusApi, tradingApi } from '@/lib/api';
-import { useTradingStore } from '@/store';
 import { Activity, RefreshCw, Timer, TrendingUp } from 'lucide-react';
 
 type ForexPairState = {
@@ -18,12 +17,12 @@ type ForexPairState = {
 };
 
 export default function ForexGridPanel() {
-  const { forexAuditFocus, setForexAuditFocus } = useTradingStore();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [botStatus, setBotStatus] = useState<any>(null);
   const [pairStates, setPairStates] = useState<ForexPairState[]>([]);
   const [forexTrades, setForexTrades] = useState<any[]>([]);
+  const [forexTickEvents, setForexTickEvents] = useState<any[]>([]);
   const [tickSeconds, setTickSeconds] = useState(1);
   const [saveMessage, setSaveMessage] = useState('');
   const [saving, setSaving] = useState(false);
@@ -50,23 +49,45 @@ export default function ForexGridPanel() {
         return;
       }
 
-      const [botRes, logsRes, configRes] = await Promise.all([
+      const [botRes, logsRes, configRes, botLogsRes] = await Promise.all([
         botApi.getStatus(),
         tradingApi.getLogs({ days: 2, assetType: 'forex', status: 'all' }),
         configApi.getCurrent(),
+        botApi.getLogs(120),
       ]);
 
       const nextStatus = botRes.data || {};
       setBotStatus(nextStatus);
       setPairStates((nextStatus.forex_grid?.pairs || []) as ForexPairState[]);
 
-      const records = (logsRes.data?.records || []) as any[];
+      const records = (logsRes.data?.logs || []) as any[];
       setForexTrades(
         records
-          .filter((r) => String(r.strategy || '').toLowerCase().includes('forex'))
+          .filter((r) => String(r.asset_type || '').toLowerCase() === 'forex' || String(r.strategy || '').toLowerCase().includes('forex'))
           .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
           .slice(0, 20)
       );
+
+      const rawBotLogs = (botLogsRes.data?.logs || []) as any[];
+      const tickEvents = rawBotLogs
+        .filter((row) => {
+          const event = String(row?.event || '').toLowerCase();
+          if (!event.includes('forex') && !event.includes('grid')) return false;
+          const opened = Number(row?.details?.opened || 0);
+          const closed = Number(row?.details?.closed || 0);
+          return opened > 0 || closed > 0;
+        })
+        .map((row) => ({
+          timestamp: row.timestamp,
+          opened: Number(row?.details?.opened || 0),
+          closed: Number(row?.details?.closed || 0),
+          realized_pnl: Number(row?.details?.realized_pnl || 0),
+          allocation_pct: Number(row?.details?.allocation_pct || 0),
+          source_event: String(row?.event || 'Forex grid tick executed'),
+        }))
+        .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
+        .slice(0, 20);
+      setForexTickEvents(tickEvents);
 
       const cfgTick = Number(configRes.data?.forex?.tick_seconds ?? 1);
       setTickSeconds(Math.max(1, Math.min(5, Number.isFinite(cfgTick) ? cfgTick : 1)));
@@ -112,9 +133,9 @@ export default function ForexGridPanel() {
     setModeBusy(true);
     setSaveMessage('');
     try {
-      await botApi.setExecutionSafety(true);
+      await botApi.setExecutionSafety(false);
       await botApi.setMode('automatic', true, 60);
-      setSaveMessage('Automatic simulated mode started. Forex grid should tick every second, including weekends.');
+      setSaveMessage('Automatic live paper mode started. Forex grid is now executing immediately.');
       await loadData();
     } catch (e: any) {
       setSaveMessage(e?.response?.data?.error || 'Failed to start automatic mode');
@@ -157,31 +178,19 @@ export default function ForexGridPanel() {
   const grid = botStatus?.forex_grid || {};
   const audit = botStatus?.strategy_audit || {};
   const pnlClass = totals.realized >= 0 ? 'text-emerald-300' : 'text-rose-300';
-  const auditCards = [
-    {
-      id: 'blowup',
-      title: 'Blowup Stocks',
-      execution: String(audit?.blowup?.execution || 'idle'),
-      message: String(audit?.blowup?.message || 'No data'),
-      meta: `Candidates: ${Number(audit?.blowup?.candidates || 0)} | Last scan ${getAge(audit?.blowup?.last_scan)} ago`,
-    },
-    {
-      id: 'covered_call',
-      title: 'Covered Call',
-      execution: String(audit?.covered_call?.execution || 'idle'),
-      message: String(audit?.covered_call?.message || 'No data'),
-      meta: `Candidates: ${Number(audit?.covered_call?.candidates || 0)} | Last scan ${getAge(audit?.covered_call?.last_scan)} ago`,
-    },
-    {
-      id: 'forex_grid',
-      title: 'Forex Grid',
-      execution: String(audit?.forex_grid?.execution || 'idle'),
-      message: String(audit?.forex_grid?.message || 'No data'),
-      meta: `Last tick ${getAge(audit?.forex_grid?.last_tick)} ago`,
-    },
-  ] as const;
-  const filteredAuditCards =
-    forexAuditFocus === 'all' ? auditCards : auditCards.filter((card) => card.id === forexAuditFocus);
+  const forexExecution = String(audit?.forex_grid?.execution || 'idle').toLowerCase();
+  const liveExecutionActive = Boolean(botStatus?.bot_running) && String(botStatus?.execution_mode || 'manual') === 'automatic' && !Boolean(botStatus?.dry_run);
+  const diagnosis = !botStatus?.bot_running
+    ? 'Bot runner is stopped. Turn Bot Power ON.'
+    : String(botStatus?.execution_mode || 'manual') !== 'automatic'
+      ? 'Bot is in manual mode. Turn Bot Power ON for auto execution.'
+      : Boolean(botStatus?.dry_run)
+        ? 'Bot is running in simulated safety mode. Disable dry-run for live paper execution.'
+        : totals.openTotal > 0 && forexTrades.length === 0
+          ? 'Auto trading is working. Open legs are active and waiting for take-profit close conditions.'
+          : Number(audit?.forex_grid?.opened || 0) === 0 && Number(audit?.forex_grid?.closed || 0) === 0
+            ? 'Auto trading is working. No new entry/exit trigger was hit on the latest tick.'
+            : 'Auto trading is actively executing forex grid logic.';
 
   return (
     <div className="space-y-5 p-4">
@@ -245,6 +254,14 @@ export default function ForexGridPanel() {
         </div>
       </div>
 
+      <div className={`rounded-2xl border p-4 ${liveExecutionActive ? 'border-emerald-700/40 bg-emerald-950/10' : 'border-amber-700/40 bg-amber-950/10'}`}>
+        <p className="text-sm font-semibold text-slate-100">Execution Diagnosis</p>
+        <p className="mt-1 text-sm text-slate-200">{diagnosis}</p>
+        <p className="mt-2 text-xs text-slate-400">
+          Forex execution: {forexExecution || 'idle'} | Last tick {getAge(audit?.forex_grid?.last_tick)} ago | Opened {Number(audit?.forex_grid?.opened || 0)} / Closed {Number(audit?.forex_grid?.closed || 0)} this tick
+        </p>
+      </div>
+
       <div className="rounded-2xl border border-slate-700/70 bg-slate-900/35 p-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
@@ -275,37 +292,15 @@ export default function ForexGridPanel() {
 
       <div className="rounded-2xl border border-emerald-700/40 bg-emerald-950/10 p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <p className="text-sm font-semibold text-slate-100">Strategy Execution Audit</p>
-          <div className="flex flex-wrap gap-2">
-            {[
-              { id: 'all', label: 'All' },
-              { id: 'blowup', label: 'Blowup' },
-              { id: 'covered_call', label: 'Covered Call' },
-              { id: 'forex_grid', label: 'Forex Grid' },
-            ].map((opt) => (
-              <button
-                key={opt.id}
-                onClick={() => setForexAuditFocus(opt.id as 'all' | 'blowup' | 'covered_call' | 'forex_grid')}
-                className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                  forexAuditFocus === opt.id
-                    ? 'border-emerald-400 bg-emerald-900/35 text-emerald-100'
-                    : 'border-slate-600/70 bg-slate-900/35 text-slate-300 hover:border-slate-400'
-                }`}
-              >
-                {opt.label}
-              </button>
-            ))}
-          </div>
+          <p className="text-sm font-semibold text-slate-100">Forex Execution Audit</p>
         </div>
-        <div className="grid gap-3 md:grid-cols-3">
-          {filteredAuditCards.map((card) => (
-            <div key={card.id} className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-3">
-              <p className="text-xs uppercase tracking-wide text-slate-400">{card.title}</p>
-              <p className="mt-1 text-sm font-semibold text-slate-100">{card.execution}</p>
-              <p className="text-xs text-slate-300">{card.message}</p>
-              <p className="text-xs text-slate-400 mt-1">{card.meta}</p>
-            </div>
-          ))}
+        <div className="grid gap-3 md:grid-cols-1">
+          <div className="rounded-xl border border-slate-700/70 bg-slate-900/35 p-3">
+            <p className="text-xs uppercase tracking-wide text-slate-400">Forex Grid</p>
+            <p className="mt-1 text-sm font-semibold text-slate-100">{String(audit?.forex_grid?.execution || 'idle')}</p>
+            <p className="text-xs text-slate-300">{String(audit?.forex_grid?.message || 'No data')}</p>
+            <p className="text-xs text-slate-400 mt-1">Last tick {getAge(audit?.forex_grid?.last_tick)} ago</p>
+          </div>
         </div>
       </div>
 
@@ -356,6 +351,47 @@ export default function ForexGridPanel() {
 
       <div className="rounded-2xl border border-slate-700/70 bg-slate-900/35 p-4">
         <p className="text-sm font-semibold text-slate-100 mb-3 inline-flex items-center gap-2">
+          <Activity size={14} /> Recent Grid Tick Events (Immediate)
+        </p>
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] text-sm">
+            <thead>
+              <tr className="border-b border-slate-700 text-left text-slate-300">
+                <th className="py-2 pr-3">Time</th>
+                <th className="py-2 pr-3">Opened</th>
+                <th className="py-2 pr-3">Closed</th>
+                <th className="py-2 pr-3">Realized P&L</th>
+                <th className="py-2 pr-3">Alloc %</th>
+                <th className="py-2">Event</th>
+              </tr>
+            </thead>
+            <tbody>
+              {forexTickEvents.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="py-4 text-slate-400">
+                    No open/close tick events yet in this session. New leg openings and closes will appear here instantly.
+                  </td>
+                </tr>
+              )}
+              {forexTickEvents.map((event, idx) => (
+                <tr key={`${event.timestamp}-${idx}`} className="border-b border-slate-800/70 text-slate-200">
+                  <td className="py-2 pr-3 text-slate-300">{new Date(event.timestamp || Date.now()).toLocaleString()}</td>
+                  <td className="py-2 pr-3 text-emerald-300">{event.opened}</td>
+                  <td className="py-2 pr-3 text-cyan-300">{event.closed}</td>
+                  <td className={`py-2 pr-3 ${event.realized_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+                    {event.realized_pnl >= 0 ? '+' : ''}{event.realized_pnl.toFixed(2)}
+                  </td>
+                  <td className="py-2 pr-3">{event.allocation_pct.toFixed(1)}</td>
+                  <td className="py-2 text-slate-300">{event.source_event}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-slate-700/70 bg-slate-900/35 p-4">
+        <p className="text-sm font-semibold text-slate-100 mb-3 inline-flex items-center gap-2">
           <TrendingUp size={14} /> Recent Forex Trades
         </p>
         <div className="overflow-x-auto">
@@ -375,7 +411,9 @@ export default function ForexGridPanel() {
             <tbody>
               {forexTrades.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="py-4 text-slate-400">No forex trades in recent history yet.</td>
+                  <td colSpan={8} className="py-4 text-slate-400">
+                    No closed forex trades yet. Grid is still active with {totals.openTotal} open legs and will print rows here when take-profit closes occur.
+                  </td>
                 </tr>
               )}
               {forexTrades.map((trade) => {

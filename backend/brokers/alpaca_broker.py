@@ -72,20 +72,30 @@ class AlpacaBroker(BaseBroker):
             last_equity = float(account.get("last_equity") or equity or 0.0)
             daily_pnl = equity - last_equity
             daily_pnl_pct = (daily_pnl / last_equity * 100.0) if last_equity else 0.0
+            unrealized_pnl = sum(float(position.pnl or 0.0) for position in positions)
+            total_pnl = float(account.get("equity") or 0.0) - float(account.get("last_equity") or 0.0)
+            realized_pnl = total_pnl - unrealized_pnl
+            base_capital = max(equity - total_pnl, 1e-9)
+            realized_pnl_pct = (realized_pnl / base_capital * 100.0) if realized_pnl else 0.0
+            unrealized_pnl_pct = (unrealized_pnl / base_capital * 100.0) if unrealized_pnl else 0.0
 
             return AccountSnapshot(
                 total_value=equity,
                 cash=float(account.get("cash") or 0.0),
                 buying_power=float(account.get("buying_power") or 0.0),
-                total_pnl=float(account.get("equity") or 0.0) - float(account.get("last_equity") or 0.0),
+                total_pnl=total_pnl,
                 total_pnl_pct=daily_pnl_pct,
+                realized_pnl=realized_pnl,
+                realized_pnl_pct=realized_pnl_pct,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl_pct=unrealized_pnl_pct,
                 daily_pnl=daily_pnl,
                 daily_pnl_pct=daily_pnl_pct,
                 positions=positions,
             )
         except Exception as e:
             logger.error("Failed to get Alpaca account snapshot: %s", e)
-            return AccountSnapshot(0.0, 0.0, 0.0, 0.0, 0.0, [])
+            return AccountSnapshot(0.0, 0.0, 0.0, 0.0, 0.0, positions=[])
 
     async def get_positions(self) -> List[Position]:
         try:
