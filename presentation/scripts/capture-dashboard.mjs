@@ -4,7 +4,7 @@ import { chromium } from 'playwright';
 
 const ROOT = process.cwd();
 const OUT_DIR = path.join(ROOT, 'public', 'screenshots');
-const BASE_URL = process.env.PRESENTATION_APP_URL || 'http://127.0.0.1:3000';
+const BASE_URL = process.env.PRESENTATION_APP_URL || 'http://localhost:3000';
 
 async function ensureDir() {
   await fs.mkdir(OUT_DIR, { recursive: true });
