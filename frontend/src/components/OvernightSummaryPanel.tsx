@@ -10,6 +10,8 @@ interface OvernightSummary {
   winning_trades: number;
   losing_trades: number;
   total_pnl: number;
+  unrealized_pnl?: number;
+  total_pnl_including_unrealized?: number;
   total_pnl_pct: number;
   win_rate: number;
   by_strategy: Record<
@@ -118,10 +120,12 @@ export default function OvernightSummaryPanel() {
         {/* Total P&L */}
         <div className="bg-gradient-to-br from-slate-800 to-slate-900 rounded-lg p-3 border border-slate-700">
           <p className="text-xs text-slate-400 mb-1">Total P&L</p>
-          <p className={`text-lg font-bold ${summary.total_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
-            {money(summary.total_pnl)}
+          <p className={`text-lg font-bold ${Number(summary.total_pnl_including_unrealized ?? summary.total_pnl) >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+            {money(Number(summary.total_pnl_including_unrealized ?? summary.total_pnl))}
           </p>
-          <p className="text-xs text-slate-500 mt-1">{summary.total_pnl_pct > 0 ? '+' : ''}{summary.total_pnl_pct.toFixed(1)}%</p>
+          <p className="text-xs text-slate-500 mt-1">
+            R {money(summary.total_pnl)} / U {money(Number(summary.unrealized_pnl || 0))}
+          </p>
         </div>
 
         {/* Trades Count */}

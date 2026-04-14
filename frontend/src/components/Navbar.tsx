@@ -277,6 +277,19 @@ export default function Navbar() {
     setForexAuditFocus(focusSleeve);
   };
 
+  const accountDataSource = String(account?.data_source || '').toLowerCase();
+  const snapshotTimestamp = account?.snapshot_timestamp || null;
+  const usingFallbackData =
+    accountDataSource.includes('snapshot') ||
+    accountDataSource.includes('fallback') ||
+    accountDataSource.includes('degraded');
+  const fallbackChipClass = accountDataSource.includes('degraded')
+    ? 'border-amber-500/60 bg-amber-900/25 text-amber-100'
+    : 'border-cyan-500/60 bg-cyan-900/25 text-cyan-100';
+  const fallbackLabel = accountDataSource.includes('degraded')
+    ? 'Degraded fallback data'
+    : 'Snapshot fallback data';
+
   return (
     <nav className="sticky top-0 z-20 border-b border-slate-700/50 bg-[#0a1c25]/80 backdrop-blur-md">
       <div className="app-shell py-2">
@@ -329,6 +342,13 @@ export default function Navbar() {
               <Activity size={12} />
               {brokerName} {brokerConnected ? 'Connected' : 'Disconnected'}
             </span>
+
+            {usingFallbackData && (
+              <span className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold ${fallbackChipClass}`}>
+                {fallbackLabel}
+                <span className="ml-2 text-slate-200/90">{snapshotTimestamp ? `${getHeartbeatAge(snapshotTimestamp)} ago` : 'timestamp unavailable'}</span>
+              </span>
+            )}
 
             {[
               { id: 'ibkr', label: 'IBKR' },

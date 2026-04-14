@@ -113,7 +113,7 @@ export default function CryptoDeskPanel() {
   const dailyLossCurrent = Number(cryptoGrid.daily_loss_current || 0);
   const dailyLossLimit = Math.max(1, Number(cryptoGrid.daily_loss_limit || 750));
   const lossUsedPct = Math.min(100, Math.max(0, (-Math.min(0, dailyLossCurrent) / dailyLossLimit) * 100));
-  const pnlClass = totals.realized >= 0 ? 'text-emerald-300' : 'text-rose-300';
+  const pnlClass = Number(cryptoGrid.total_pnl || totals.realized) >= 0 ? 'text-emerald-300' : 'text-rose-300';
 
   return (
     <div className="space-y-5 p-4">
@@ -148,9 +148,9 @@ export default function CryptoDeskPanel() {
           <p className="text-xs text-slate-400">Across {cryptoGrid.symbols_configured ?? symbols.length} symbols</p>
         </div>
         <div className="rounded-xl border border-slate-700/70 bg-slate-900/40 p-3">
-          <p className="text-xs uppercase tracking-wide text-slate-400">Realized P&L</p>
-          <p className={`mt-1 text-lg font-semibold ${pnlClass}`}>{totals.realized >= 0 ? '+' : ''}{totals.realized.toFixed(2)}</p>
-          <p className="text-xs text-slate-400">Last cycle {getAge(cryptoGrid.last_cycle)} ago</p>
+          <p className="text-xs uppercase tracking-wide text-slate-400">P&L (R + U)</p>
+          <p className={`mt-1 text-lg font-semibold ${pnlClass}`}>{Number(cryptoGrid.total_pnl || totals.realized) >= 0 ? '+' : ''}{Number(cryptoGrid.total_pnl || totals.realized).toFixed(2)}</p>
+          <p className="text-xs text-slate-400">R {Number(cryptoGrid.realized_pnl || totals.realized).toFixed(2)} / U {Number(cryptoGrid.unrealized_pnl || 0).toFixed(2)}</p>
         </div>
         <div className="rounded-xl border border-slate-700/70 bg-slate-900/40 p-3">
           <p className="text-xs uppercase tracking-wide text-slate-400">Broker Crypto Capability</p>

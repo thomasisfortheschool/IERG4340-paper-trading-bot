@@ -49,9 +49,7 @@ export const tradingApi = {
     const days = params?.days ?? 30;
     const assetType = params?.assetType ?? 'all';
     const status = params?.status ?? 'all';
-    return api.get(
-      `/trade/logs?days=${days}&asset_type=${encodeURIComponent(assetType)}&status=${encodeURIComponent(status)}`
-    );
+    return api.get(`/trade/logs?days=${days}&asset_type=${encodeURIComponent(assetType)}&status=${encodeURIComponent(status)}`);
   },
   tryBuySell: (
     rounds: number = 6,

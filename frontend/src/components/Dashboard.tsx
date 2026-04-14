@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTradingStore } from '@/store';
 import { accountApi } from '@/lib/api';
 import PortfolioChart from './PortfolioChart';
@@ -28,18 +28,48 @@ export default function Dashboard() {
   const [strategiesView, setStrategiesView] = useState<'performance' | 'configuration'>('performance');
   const [toolsView, setToolsView] = useState<'backtest' | 'summary'>('summary');
   const [history, setHistory] = useState([]);
+  const [historySource, setHistorySource] = useState('unknown');
+  const [historySnapshotTimestamp, setHistorySnapshotTimestamp] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState('');
-  const { setAccount, setPositions, refreshToken, selectedBroker, activeTab, setActiveTab } = useTradingStore();
+  const { account, setAccount, setPositions, refreshToken, selectedBroker, activeTab, setActiveTab } = useTradingStore();
+  const fullFailureStreakRef = useRef(0);
+  const partialFailureStreakRef = useRef(0);
+  const accountDataSource = String(account?.data_source || '').toLowerCase();
+  const isFallbackData =
+    accountDataSource.includes('snapshot') ||
+    accountDataSource.includes('fallback') ||
+    accountDataSource.includes('degraded');
+
+  const withTimeout = async <T,>(promise: Promise<T>, ms: number): Promise<T> => {
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('request timeout')), ms);
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+  };
 
   useEffect(() => {
+    let canceled = false;
+
     const fetchData = async () => {
       try {
         const [accountRes, historyRes, posRes] = await Promise.allSettled([
-          accountApi.getSnapshot(),
-          accountApi.getHistory(30),
-          accountApi.getPositions(),
+          withTimeout(accountApi.getSnapshot(), 15000),
+          withTimeout(accountApi.getHistory(30), 15000),
+          withTimeout(accountApi.getPositions(), 15000),
         ]);
+
+        if (canceled) {
+          return;
+        }
 
         if (accountRes.status === 'fulfilled') {
           setAccount(accountRes.value.data);
@@ -47,6 +77,8 @@ export default function Dashboard() {
 
         if (historyRes.status === 'fulfilled') {
           setHistory(historyRes.value.data.history || []);
+          setHistorySource(String(historyRes.value.data?.data_source || 'unknown'));
+          setHistorySnapshotTimestamp(historyRes.value.data?.snapshot_timestamp || null);
         }
 
         if (posRes.status === 'fulfilled') {
@@ -55,22 +87,48 @@ export default function Dashboard() {
 
         const failed = [accountRes, historyRes, posRes].filter((r) => r.status === 'rejected').length;
         if (failed === 0) {
+          fullFailureStreakRef.current = 0;
+          partialFailureStreakRef.current = 0;
           setFetchError('');
         } else if (failed < 3) {
-          setFetchError('Partial refresh: some dashboard data is temporarily unavailable.');
+          fullFailureStreakRef.current = 0;
+          partialFailureStreakRef.current += 1;
+          if (partialFailureStreakRef.current >= 2) {
+            setFetchError('Partial refresh: some dashboard data is temporarily unavailable.');
+          }
         } else {
-          setFetchError('Dashboard API unreachable. Check backend server on port 5000.');
+          fullFailureStreakRef.current += 1;
+          partialFailureStreakRef.current = 0;
+          setFetchError(
+            fullFailureStreakRef.current >= 2
+              ? 'Live broker data is delayed. Dashboard is retrying with fallback data.'
+              : 'Connecting to dashboard APIs...'
+          );
         }
       } catch {
-        setFetchError('Dashboard API unreachable. Check backend server on port 5000.');
+        if (canceled) {
+          return;
+        }
+        fullFailureStreakRef.current += 1;
+        partialFailureStreakRef.current = 0;
+        setFetchError(
+          fullFailureStreakRef.current >= 2
+            ? 'Live broker data is delayed. Dashboard is retrying with fallback data.'
+            : 'Connecting to dashboard APIs...'
+        );
       } finally {
-        setLoading(false);
+        if (!canceled) {
+          setLoading(false);
+        }
       }
     };
 
     fetchData();
     const interval = setInterval(fetchData, 30000); // Refresh every 30s
-    return () => clearInterval(interval);
+    return () => {
+      canceled = true;
+      clearInterval(interval);
+    };
   }, [setAccount, setPositions, refreshToken, selectedBroker]);
 
   if (loading) return <div className="app-shell py-8 text-center text-slate-300">Loading dashboard data...</div>;
@@ -86,6 +144,11 @@ export default function Dashboard() {
       <div className="mb-3 text-xs text-slate-300">
         Active data source: <span className="text-slate-100 uppercase">{selectedBroker}</span>
       </div>
+      {isFallbackData && (
+        <div className="mb-3 rounded-xl border border-amber-700/50 bg-amber-900/20 px-3 py-2 text-xs text-amber-100">
+          Live broker response is delayed. Dashboard is showing cached snapshot/fallback values.
+        </div>
+      )}
       <div className="mb-6 rounded-2xl border border-slate-700/70 bg-slate-900/30 p-2">
         <div className="scroll-row md:flex md:flex-wrap md:gap-2">
         {[
@@ -121,7 +184,11 @@ export default function Dashboard() {
         {activeTab === 'home' && (
           <div className="space-y-6">
             <MarketOverviewPanel />
-            <PortfolioChart history={history} source={selectedBroker} />
+            <PortfolioChart
+              history={history}
+              source={historySource || selectedBroker}
+              snapshotTimestamp={historySnapshotTimestamp}
+            />
           </div>
         )}
 

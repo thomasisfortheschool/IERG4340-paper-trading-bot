@@ -9,7 +9,7 @@ type TradeLog = {
   trade_id: string;
   timestamp: string;
   strategy: string;
-  asset_type: 'stock' | 'option' | 'forex';
+  asset_type: 'stock' | 'option' | 'forex' | 'crypto' | string;
   symbol: string;
   underlying: string;
   side: string;
@@ -31,6 +31,25 @@ const money = (value: number) =>
     currency: 'USD',
     maximumFractionDigits: 2,
   }).format(value);
+
+const hktTimeFormatter = new Intl.DateTimeFormat('en-HK', {
+  timeZone: 'Asia/Hong_Kong',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+const formatHkt = (iso: string) => {
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) {
+    return iso;
+  }
+  return `${hktTimeFormatter.format(dt)} HKT`;
+};
 
 export default function TradingLogPanel() {
   const [logs, setLogs] = useState<TradeLog[]>([]);
@@ -212,8 +231,9 @@ export default function TradingLogPanel() {
               className="input-modern"
             >
               <option value="all">All Execution</option>
-              <option value="live_paper">Live Paper</option>
-              <option value="broker">Live Fill</option>
+              <option value="live_paper">Bot Ledger</option>
+              <option value="broker">Broker Fill Feed</option>
+              <option value="simulated">Simulated</option>
             </select>
 
             <input
@@ -222,6 +242,7 @@ export default function TradingLogPanel() {
               placeholder="Search symbol / trade id"
               className="input-modern"
             />
+
           </div>
         </div>
       </div>
@@ -233,7 +254,7 @@ export default function TradingLogPanel() {
             {loading ? 'Loading records...' : `${filteredLogs.length} records`}
           </div>
           <div className="text-xs text-slate-300">
-            Source: <span className="text-slate-100 uppercase">{source === 'bot_ledger' ? 'BOT LEDGER' : source}</span>
+            Source: <span className="text-slate-100 uppercase">{source === 'bot_ledger' ? 'BOT LEDGER' : source === 'combined' ? 'COMBINED (LEDGER + BROKER)' : source}</span>
           </div>
           <div className="inline-flex items-center gap-2">
             <button
@@ -255,11 +276,15 @@ export default function TradingLogPanel() {
           </div>
         </div>
 
+        <div className="px-4 py-2 border-b border-slate-700/60 bg-slate-900/30 text-xs text-slate-300">
+          This is all paper mode. Bot Ledger = records written by this bot. Broker Fill Feed = executions reported by IB fill feed.
+        </div>
+
         <div className="overflow-x-auto">
           <table className="w-full min-w-[1260px] text-sm">
             <thead>
               <tr className="bg-slate-900/45 text-slate-300">
-                <th className="px-3 py-3 text-left font-semibold">Time</th>
+                <th className="px-3 py-3 text-left font-semibold">Time (HKT)</th>
                 <th className="px-3 py-3 text-left font-semibold">Trade ID</th>
                 <th className="px-3 py-3 text-left font-semibold">Execution</th>
                 <th className="px-3 py-3 text-left font-semibold">Type</th>
@@ -286,60 +311,64 @@ export default function TradingLogPanel() {
               {filteredLogs.map((row) => {
                 const executionType = row.execution_origin === 'live_paper'
                   ? 'live_paper'
-                  : row.execution_origin === 'broker'
-                    ? 'broker'
-                    : (row.is_simulated ? 'simulated' : 'broker');
+                  : row.execution_origin === 'simulated' || row.is_simulated === true
+                    ? 'simulated'
+                    : 'broker';
                 const executionClass = executionType === 'live_paper'
                   ? 'bg-emerald-900/30 border-emerald-500/50 text-emerald-200'
                   : executionType === 'simulated'
                     ? 'bg-slate-800 border-slate-500/50 text-slate-200'
                     : 'bg-cyan-900/30 border-cyan-500/50 text-cyan-200';
                 const executionLabel = executionType === 'live_paper'
-                  ? 'LIVE PAPER'
+                  ? 'BOT LEDGER'
                   : executionType === 'simulated'
                     ? 'SIMULATED'
-                    : 'LIVE FILL';
+                    : 'BROKER FILL';
 
                 return (
-                <tr key={row.trade_id} className="border-t border-slate-700/55 hover:bg-slate-900/25">
-                  <td className="px-3 py-3 text-slate-200">{new Date(row.timestamp).toLocaleString()}</td>
-                  <td className="px-3 py-3 text-slate-200 font-medium">{row.trade_id}</td>
-                  <td className="px-3 py-3">
-                    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs border font-semibold ${executionClass}`}>
-                      <Building2 size={12} />
-                      {executionLabel}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3">
-                    <span className={`rounded-full px-2 py-0.5 text-xs border ${
-                      row.asset_type === 'option'
-                        ? 'bg-violet-900/35 border-violet-500/40 text-violet-200'
-                        : row.asset_type === 'forex'
-                          ? 'bg-cyan-900/35 border-cyan-500/40 text-cyan-200'
-                          : 'bg-slate-800 border-slate-500/40 text-slate-200'
-                    }`}>
-                      {row.asset_type.toUpperCase()}
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 text-slate-100 font-medium">
-                    <span className="inline-flex items-center gap-2">
-                      <span>{row.symbol}</span>
-                      <span className="rounded-full px-2 py-0.5 text-[10px] border border-sky-700/60 bg-sky-900/35 text-sky-200">
-                        {inferMarket(row.symbol)}
+                  <tr key={row.trade_id} className="border-t border-slate-700/55 hover:bg-slate-900/25">
+                    <td className="px-3 py-3 text-slate-200">{formatHkt(row.timestamp)}</td>
+                    <td className="px-3 py-3 text-slate-200 font-medium">{row.trade_id}</td>
+                    <td className="px-3 py-3">
+                      <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs border font-semibold ${executionClass}`}>
+                        <Building2 size={12} />
+                        {executionLabel}
                       </span>
-                    </span>
-                  </td>
-                  <td className="px-3 py-3 text-slate-200">{row.side}</td>
-                  <td className="px-3 py-3 text-right text-slate-200">{row.quantity.toLocaleString()}</td>
-                  <td className="px-3 py-3 text-right text-slate-200">{money(row.entry_price)}</td>
-                  <td className="px-3 py-3 text-right text-slate-200">{row.exit_price == null ? '-' : money(row.exit_price)}</td>
-                  <td className="px-3 py-3 text-right text-slate-300">{money(row.fees)}</td>
-                  <td className={`px-3 py-3 text-right font-semibold ${row.net_pnl >= 0 ? 'text-profit' : 'text-loss'}`}>
-                    {row.net_pnl >= 0 ? '+' : ''}{money(row.net_pnl)}
-                  </td>
-                  <td className="px-3 py-3 text-slate-200">{row.strategy}</td>
-                  <td className="px-3 py-3 text-slate-300">{row.notes}</td>
-                </tr>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className={`rounded-full px-2 py-0.5 text-xs border ${
+                        row.asset_type === 'option'
+                          ? 'bg-violet-900/35 border-violet-500/40 text-violet-200'
+                          : row.asset_type === 'forex'
+                            ? 'bg-cyan-900/35 border-cyan-500/40 text-cyan-200'
+                            : 'bg-slate-800 border-slate-500/40 text-slate-200'
+                      }`}>
+                        {row.asset_type.toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 text-slate-100 font-medium">
+                      <span className="inline-flex items-center gap-2">
+                        <span>{row.symbol}</span>
+                        <span className="rounded-full px-2 py-0.5 text-[10px] border border-sky-700/60 bg-sky-900/35 text-sky-200">
+                          {inferMarket(row.symbol)}
+                        </span>
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 text-slate-200">
+                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${String(row.side).toLowerCase() === 'buy' ? 'border-emerald-500/50 bg-emerald-900/30 text-emerald-200' : String(row.side).toLowerCase() === 'sell' ? 'border-rose-500/50 bg-rose-900/25 text-rose-200' : 'border-indigo-500/50 bg-indigo-900/25 text-indigo-200'}`}>
+                        {String(row.side).toLowerCase() === 'buy' ? 'BUY' : String(row.side).toLowerCase() === 'sell' ? 'SELL' : 'MARK'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 text-right text-slate-200">{row.quantity.toLocaleString()}</td>
+                    <td className="px-3 py-3 text-right text-slate-200">{money(row.entry_price)}</td>
+                    <td className="px-3 py-3 text-right text-slate-200">{row.exit_price == null ? '-' : money(row.exit_price)}</td>
+                    <td className="px-3 py-3 text-right text-slate-300">{money(row.fees)}</td>
+                    <td className={`px-3 py-3 text-right font-semibold ${row.net_pnl >= 0 ? 'text-profit' : 'text-loss'}`}>
+                      {row.net_pnl >= 0 ? '+' : ''}{money(row.net_pnl)}
+                    </td>
+                    <td className="px-3 py-3 text-slate-200">{row.strategy}</td>
+                    <td className="px-3 py-3 text-slate-300">{row.notes}</td>
+                  </tr>
                 );
               })}
             </tbody>

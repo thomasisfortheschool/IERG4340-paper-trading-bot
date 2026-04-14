@@ -1,0 +1,20 @@
+{
+  "name": "paper-trading-bot-presentation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "capture": "node scripts/capture-dashboard.mjs",
+    "generate": "node scripts/generate-slides.mjs",
+    "prep": "npm run capture && npm run generate",
+    "dev": "slidev slides.md --open",
+    "build": "slidev build slides.md",
+    "export:pdf": "slidev export slides.md",
+    "pitch": "npm run prep && npm run dev"
+  },
+  "devDependencies": {
+    "@slidev/cli": "^52.14.2",
+    "@slidev/theme-apple-basic": "^0.25.0",
+    "playwright": "^1.54.2"
+  }
+}

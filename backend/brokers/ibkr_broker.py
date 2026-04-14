@@ -7,9 +7,11 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 import logging
 import re
+import math
 
 from ib_insync import IB, Stock, Option, Forex, Contract, Index, MarketOrder, LimitOrder
 import pandas as pd
+import yfinance as yf
 
 from .base_broker import BaseBroker, Position, Order, AccountSnapshot, BrokerFactory
 
@@ -72,7 +74,8 @@ class IBKRBroker(BaseBroker):
             if buying_power == 0:
                 buying_power = float(self._get_account_value(account_summary, "AvailableFunds", account_id, display_currency))
 
-            positions = await self.get_positions()
+            # Keep snapshot path lightweight; positions are retrieved via dedicated endpoint.
+            positions: List[Position] = []
 
             realized = float(self._get_account_value(account_summary, "RealizedPnL", account_id, display_currency))
             unrealized = float(self._get_account_value(account_summary, "UnrealizedPnL", account_id, display_currency))
@@ -104,20 +107,67 @@ class IBKRBroker(BaseBroker):
         try:
             positions = self.ib.positions()
             result = []
+
+            contracts = []
+            for pos in positions:
+                contract = getattr(pos, "contract", None)
+                if contract is None:
+                    continue
+                contracts.append(self._normalize_contract_for_quote(contract))
+            price_by_conid: Dict[int, float] = {}
+
+            if contracts:
+                # Request one contract at a time so one malformed/permission-denied symbol
+                # does not block the entire positions payload.
+                for contract in contracts:
+                    try:
+                        tickers = await asyncio.wait_for(self.ib.reqTickersAsync(contract), timeout=1.5)
+                    except Exception:
+                        continue
+
+                    for ticker in tickers or []:
+                        ticker_contract = getattr(ticker, "contract", None)
+                        con_id = int(getattr(ticker_contract, "conId", 0) or 0) if ticker_contract is not None else 0
+                        if con_id <= 0:
+                            continue
+
+                        bid = float(getattr(ticker, "bid", 0.0) or 0.0)
+                        ask = float(getattr(ticker, "ask", 0.0) or 0.0)
+                        last = float(getattr(ticker, "last", 0.0) or 0.0)
+                        close = float(getattr(ticker, "close", 0.0) or 0.0)
+
+                        px = (bid + ask) / 2 if bid > 0 and ask > 0 else (last if last > 0 else close)
+                        if px > 0:
+                            price_by_conid[con_id] = px
             
             for pos in positions:
                 contract = pos.contract
                 qty = float(getattr(pos, "position", 0.0) or 0.0)
                 avg_price = float(getattr(pos, "avgCost", 0.0) or 0.0)
-                # IB position objects do not expose marketValue consistently; compute from latest mid when available.
-                current_price = await self._get_market_price(contract)
+                con_id = int(getattr(contract, "conId", 0) or 0)
+                current_price = float(price_by_conid.get(con_id, 0.0) or 0.0)
+                if not math.isfinite(float(current_price or 0.0)):
+                    current_price = avg_price
+                if current_price <= 0:
+                    try:
+                        current_price = float(await self._get_market_price(contract) or 0.0)
+                    except Exception:
+                        current_price = 0.0
+                if current_price <= 0:
+                    current_price = avg_price
                 basis = avg_price * qty
                 market_value = current_price * qty if current_price > 0 else basis
                 pnl = market_value - basis
                 pnl_pct = (pnl / abs(basis)) * 100 if basis else 0
+                symbol = contract.symbol
+                if str(getattr(contract, "secType", "")).upper() == "CASH":
+                    base = str(getattr(contract, "symbol", "") or "").upper()
+                    quote = str(getattr(contract, "currency", "") or "").upper()
+                    if base and quote:
+                        symbol = f"{base}{quote}"
                 
                 position = Position(
-                    symbol=contract.symbol,
+                    symbol=symbol,
                     quantity=qty,
                     avg_price=avg_price,
                     current_price=current_price,
@@ -179,8 +229,9 @@ class IBKRBroker(BaseBroker):
             qualified = await self.ib.qualifyContractsAsync(contract)
             if qualified:
                 contract = qualified[0]
+            contract = self._normalize_contract_for_quote(contract)
 
-            trade = self.ib.placeOrder(contract, MarketOrder(side.upper(), int(quantity)))
+            trade = self.ib.placeOrder(contract, MarketOrder(side.upper(), int(quantity), tif="IOC"))
             return Order(
                 order_id=str(trade.order.orderId),
                 symbol=normalized,
@@ -207,6 +258,7 @@ class IBKRBroker(BaseBroker):
             qualified = await self.ib.qualifyContractsAsync(contract)
             if qualified:
                 contract = qualified[0]
+            contract = self._normalize_contract_for_quote(contract)
 
             side_upper = side.upper()
             if side_upper == "BUY":
@@ -231,9 +283,10 @@ class IBKRBroker(BaseBroker):
 
                 order = MarketOrder(side_upper, 0)
                 order.cashQty = round(max(notional_usd, 10.0), 2)
+                order.tif = "IOC"
                 trade = self.ib.placeOrder(contract, order)
             else:
-                trade = self.ib.placeOrder(contract, MarketOrder(side_upper, float(quantity)))
+                trade = self.ib.placeOrder(contract, MarketOrder(side_upper, float(quantity), tif="IOC"))
             return Order(
                 order_id=str(trade.order.orderId),
                 symbol=normalized,
@@ -339,6 +392,15 @@ class IBKRBroker(BaseBroker):
                 contract = qualified[0]
             tickers = await self.ib.reqTickersAsync(contract)
             if not tickers:
+                market_price = await self._get_market_price(contract)
+                if market_price > 0:
+                    return {
+                        "symbol": symbol,
+                        "bid": market_price,
+                        "ask": market_price,
+                        "last": market_price,
+                        "mid": market_price,
+                    }
                 return {}
             ticker = tickers[0]
             bid = float(getattr(ticker, "bid", 0.0) or 0.0)
@@ -457,6 +519,8 @@ class IBKRBroker(BaseBroker):
                 sec_type = str(getattr(contract, "secType", "STK")).upper()
                 if sec_type == "OPT":
                     normalized_type = "option"
+                elif sec_type == "CRYPTO":
+                    normalized_type = "crypto"
                 elif sec_type in {"CASH", "FX"}:
                     normalized_type = "forex"
                 else:
@@ -472,7 +536,13 @@ class IBKRBroker(BaseBroker):
 
                 qty = abs(float(getattr(execution, "shares", 0.0) or 0.0))
                 price = float(getattr(execution, "price", 0.0) or 0.0)
-                side = str(getattr(execution, "side", "")).lower() or "buy"
+                raw_side = str(getattr(execution, "side", "") or "").strip().upper()
+                if raw_side in {"BOT", "BUY"}:
+                    side = "buy"
+                elif raw_side in {"SLD", "SELL"}:
+                    side = "sell"
+                else:
+                    side = "buy"
                 fees = float(getattr(commission_report, "commission", 0.0) or 0.0)
 
                 row = {
@@ -649,6 +719,8 @@ class IBKRBroker(BaseBroker):
             except Exception:
                 pass
 
+            normalized = self._normalize_contract_for_quote(normalized)
+
             tickers = await self.ib.reqTickersAsync(normalized)
             if not tickers:
                 return float(getattr(contract, "strike", 0.0) or 0.0)
@@ -658,9 +730,84 @@ class IBKRBroker(BaseBroker):
             ask = float(getattr(ticker, "ask", 0.0) or 0.0)
             if bid > 0 and ask > 0:
                 return (bid + ask) / 2
-            return float(getattr(ticker, "last", 0.0) or 0.0)
+            last = float(getattr(ticker, "last", 0.0) or 0.0)
+            if last > 0:
+                return last
+
+            close = float(getattr(ticker, "close", 0.0) or 0.0)
+            if close > 0:
+                return close
+
+            sec_type = str(getattr(normalized, "secType", "") or "").upper()
+            symbol = str(getattr(normalized, "symbol", "") or "").upper().strip()
+            currency = str(getattr(normalized, "currency", "") or "").upper().strip()
+            yf_symbol = None
+            if sec_type == "CASH" and symbol and currency:
+                yf_symbol = f"{symbol}{currency}=X"
+            elif sec_type == "STK" and symbol:
+                yf_symbol = symbol
+            elif sec_type == "CRYPTO" and symbol and currency:
+                yf_symbol = f"{symbol}-{currency}"
+
+            if yf_symbol:
+                try:
+                    yf_ticker = yf.Ticker(yf_symbol)
+
+                    fast_info = getattr(yf_ticker, "fast_info", None)
+                    for key in ("lastPrice", "regularMarketPrice", "previousClose"):
+                        try:
+                            value = getattr(fast_info, key, None) if fast_info is not None else None
+                            if value is None and hasattr(fast_info, "get"):
+                                value = fast_info.get(key)
+                            fast_value = float(value) if value is not None else 0.0
+                            if fast_value > 0:
+                                return fast_value
+                        except Exception:
+                            continue
+
+                    try:
+                        info = yf_ticker.info or {}
+                        for key in ("regularMarketPrice", "currentPrice", "previousClose"):
+                            info_value = float(info.get(key) or 0.0)
+                            if info_value > 0:
+                                return info_value
+                    except Exception:
+                        pass
+
+                    for period, interval in (("5d", "1d"), ("1d", "5m"), ("1d", "1m")):
+                        hist = yf_ticker.history(period=period, interval=interval, auto_adjust=False)
+                        if hist is not None and not hist.empty:
+                            close_series = hist.get("Close")
+                            if close_series is not None and len(close_series) > 0:
+                                close_value = float(close_series.dropna().iloc[-1])
+                                if close_value > 0:
+                                    return close_value
+                except Exception:
+                    pass
+
+            return 0.0
         except Exception:
             return 0.0
+
+    def _normalize_contract_for_quote(self, contract: Contract) -> Contract:
+        """Ensure a contract has an exchange accepted by IBKR market-data endpoints."""
+        if contract is None:
+            return contract
+
+        try:
+            sec_type = str(getattr(contract, "secType", "") or "").upper()
+            exchange = str(getattr(contract, "exchange", "") or "").strip().upper()
+
+            if sec_type == "CASH" and not exchange:
+                contract.exchange = "IDEALPRO"
+            elif sec_type == "STK" and not exchange:
+                contract.exchange = "SMART"
+            elif sec_type == "CRYPTO" and not exchange:
+                contract.exchange = "PAXOS"
+        except Exception:
+            return contract
+
+        return contract
     
     def _get_asset_type(self, contract: Contract) -> str:
         """Determine asset type from contract."""

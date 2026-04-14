@@ -23,7 +23,7 @@ export default function ForexGridPanel() {
   const [pairStates, setPairStates] = useState<ForexPairState[]>([]);
   const [forexTrades, setForexTrades] = useState<any[]>([]);
   const [forexTickEvents, setForexTickEvents] = useState<any[]>([]);
-  const [tickSeconds, setTickSeconds] = useState(1);
+  const [tickSeconds, setTickSeconds] = useState(3);
   const [saveMessage, setSaveMessage] = useState('');
   const [saving, setSaving] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
@@ -89,8 +89,8 @@ export default function ForexGridPanel() {
         .slice(0, 20);
       setForexTickEvents(tickEvents);
 
-      const cfgTick = Number(configRes.data?.forex?.tick_seconds ?? 1);
-      setTickSeconds(Math.max(1, Math.min(5, Number.isFinite(cfgTick) ? cfgTick : 1)));
+      const cfgTick = Number(configRes.data?.forex?.tick_seconds ?? 3);
+      setTickSeconds(Math.max(3, Math.min(30, Number.isFinite(cfgTick) ? cfgTick : 3)));
       setError('');
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Failed to load forex grid data');
@@ -117,7 +117,7 @@ export default function ForexGridPanel() {
         ...currentConfig,
         forex: {
           ...(currentConfig.forex || {}),
-          tick_seconds: Math.max(1, Math.min(5, tickSeconds)),
+          tick_seconds: Math.max(3, Math.min(30, tickSeconds)),
         },
       };
       await configApi.update(nextConfig);
@@ -177,7 +177,7 @@ export default function ForexGridPanel() {
 
   const grid = botStatus?.forex_grid || {};
   const audit = botStatus?.strategy_audit || {};
-  const pnlClass = totals.realized >= 0 ? 'text-emerald-300' : 'text-rose-300';
+  const pnlClass = Number(grid.total_pnl || totals.realized) >= 0 ? 'text-emerald-300' : 'text-rose-300';
   const forexExecution = String(audit?.forex_grid?.execution || 'idle').toLowerCase();
   const liveExecutionActive = Boolean(botStatus?.bot_running) && String(botStatus?.execution_mode || 'manual') === 'automatic' && !Boolean(botStatus?.dry_run);
   const diagnosis = !botStatus?.bot_running
@@ -241,9 +241,9 @@ export default function ForexGridPanel() {
           <p className="text-xs text-slate-400">Across {grid.pairs_configured ?? 0} pairs</p>
         </div>
         <div className="rounded-xl border border-slate-700/70 bg-slate-900/40 p-3">
-          <p className="text-xs uppercase tracking-wide text-slate-400">Realized P&L</p>
-          <p className={`mt-1 text-lg font-semibold ${pnlClass}`}>{totals.realized >= 0 ? '+' : ''}{totals.realized.toFixed(2)}</p>
-          <p className="text-xs text-slate-400">Grid cycle {getAge(grid.last_cycle)} ago</p>
+          <p className="text-xs uppercase tracking-wide text-slate-400">P&L (R + U)</p>
+          <p className={`mt-1 text-lg font-semibold ${pnlClass}`}>{Number(grid.total_pnl || totals.realized) >= 0 ? '+' : ''}{Number(grid.total_pnl || totals.realized).toFixed(2)}</p>
+          <p className="text-xs text-slate-400">R {Number(grid.realized_pnl || totals.realized).toFixed(2)} / U {Number(grid.unrealized_pnl || 0).toFixed(2)}</p>
         </div>
         <div className="rounded-xl border border-slate-700/70 bg-slate-900/40 p-3">
           <p className="text-xs uppercase tracking-wide text-slate-400">Bot</p>
@@ -266,16 +266,16 @@ export default function ForexGridPanel() {
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
             <p className="text-sm font-semibold text-slate-100">Grid Tick Speed</p>
-            <p className="text-xs text-slate-400">Use 1 second for high-frequency scalping behavior.</p>
+            <p className="text-xs text-slate-400">Lower values are faster but place more load on broker/data APIs.</p>
           </div>
           <div className="flex items-center gap-2">
             <label className="text-xs text-slate-300">Seconds</label>
             <input
               type="number"
-              min={1}
-              max={5}
+              min={3}
+              max={30}
               value={tickSeconds}
-              onChange={(e) => setTickSeconds(Math.max(1, Math.min(5, Number(e.target.value) || 1)))}
+              onChange={(e) => setTickSeconds(Math.max(3, Math.min(30, Number(e.target.value) || 3)))}
               className="input-modern w-24"
             />
             <button

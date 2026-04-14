@@ -16,11 +16,26 @@ export default function RiskManagementPanel() {
     return () => clearInterval(interval);
   }, []);
 
+  const withTimeout = async <T,>(promise: Promise<T>, ms: number): Promise<T> => {
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('request timeout')), ms);
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+  };
+
   const loadData = async () => {
     try {
       const [posRes, regimeRes] = await Promise.allSettled([
-        riskApi.getPositionRisks(),
-        marketApi.getRegime(),
+        withTimeout(riskApi.getPositionRisks(), 15000),
+        withTimeout(marketApi.getRegime(), 12000),
       ]);
 
       if (posRes.status === 'fulfilled') {

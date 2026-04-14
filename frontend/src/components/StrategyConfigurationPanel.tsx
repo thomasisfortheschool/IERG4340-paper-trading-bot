@@ -84,7 +84,7 @@ export default function StrategyConfigurationPanel() {
     try {
       setLoading(true);
       const res = await configApi.getCurrent();
-      const config = res.data.config || {};
+      const config = res.data || {};
 
       // Update strategies based on config if it exists
       const strategies_config = config.strategies || {};
@@ -121,6 +121,7 @@ export default function StrategyConfigurationPanel() {
 
       await configApi.update({
         strategies: strategiesConfig,
+        strategy_allocation_scope: 'stock_sleeve',
       });
 
       setLastSync(new Date().toLocaleTimeString());
@@ -189,8 +190,9 @@ export default function StrategyConfigurationPanel() {
           <p className="font-semibold mb-2">💡 How Strategy Selection Works</p>
           <ul className="text-xs space-y-1 text-blue-200 list-disc list-inside">
             <li>Enable/disable strategies to activate them in automatic mode</li>
-            <li>Allocation % determines how much capital each strategy gets</li>
-            <li>Total allocation should not exceed 100%</li>
+            <li>Allocation % is a split inside the stock sleeve only</li>
+            <li>Portfolio-level split (stocks/options/forex) is controlled in Bot Configuration</li>
+            <li>Enabled strategy allocations are normalized to 100% of the stock sleeve</li>
             <li>Watch the Performance tab to see real-time results</li>
             <li>The bot scans continuously and executes trades when entry criteria are met</li>
           </ul>
@@ -273,7 +275,7 @@ export default function StrategyConfigurationPanel() {
         {/* Warnings */}
         {totalAllocation > 100 && (
           <div className="mx-4 mb-4 p-3 bg-rose-900/30 border border-rose-700/50 rounded text-sm text-rose-100">
-            ⚠️ Total allocation exceeds 100% ({totalAllocation}%). Please adjust strategy allocations.
+            ⚠️ Total allocation exceeds 100% ({totalAllocation}%). Saved values are normalized to 100% of the stock sleeve.
           </div>
         )}
 

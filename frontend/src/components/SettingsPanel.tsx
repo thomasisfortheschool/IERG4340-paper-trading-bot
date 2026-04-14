@@ -29,6 +29,7 @@ export default function SettingsPanel() {
   const [botLastRun, setBotLastRun] = useState<string | null>(null);
   const [botLastError, setBotLastError] = useState<string | null>(null);
   const [positionsSnapshot, setPositionsSnapshot] = useState<any[]>([]);
+  const [accountTotalValue, setAccountTotalValue] = useState(0);
   const [settingsConfig, setSettingsConfig] = useState<any>(null);
   const [cryptoEnabled, setCryptoEnabled] = useState(false);
   const [cryptoSymbolsInput, setCryptoSymbolsInput] = useState('BTC-USD, ETH-USD');
@@ -121,10 +122,11 @@ export default function SettingsPanel() {
     let mounted = true;
 
     const syncRuntimeStatus = async () => {
-      const [botResult, healthResult, positionsResult] = await Promise.allSettled([
+      const [botResult, healthResult, positionsResult, accountResult] = await Promise.allSettled([
         botApi.getStatus(),
         statusApi.getHealth(),
         accountApi.getPositions(),
+        accountApi.getSnapshot(),
       ]);
 
       if (!mounted) return;
@@ -140,6 +142,10 @@ export default function SettingsPanel() {
 
       if (positionsResult.status === 'fulfilled') {
         setPositionsSnapshot(positionsResult.value.data?.positions || []);
+      }
+
+      if (accountResult.status === 'fulfilled') {
+        setAccountTotalValue(Number(accountResult.value.data?.total_value || 0));
       }
 
       setBackendOnline(healthResult.status === 'fulfilled' && healthResult.value?.data?.status === 'healthy');
@@ -459,6 +465,28 @@ export default function SettingsPanel() {
     }
   );
 
+  const targetStocksPct = Math.max(0, Number(customAllocation.blowup_stocks_pct || 0));
+  const targetOptionsPct = Math.max(0, Number(customAllocation.covered_calls_pct || 0));
+  const targetForexPct = Math.max(0, Number(customAllocation.forex_pct || 0)) * (cryptoEnabled ? 0.7 : 1.0);
+  const targetCryptoPct = cryptoEnabled ? Math.max(0, Number(customAllocation.forex_pct || 0)) * 0.3 : 0;
+
+  const effectiveDenominator =
+    accountTotalValue > 0
+      ? accountTotalValue
+      : sleeveStats.stocks.notional + sleeveStats.options.notional + sleeveStats.forex.notional + sleeveStats.crypto.notional;
+
+  const actualStocksPct = effectiveDenominator > 0 ? (sleeveStats.stocks.notional / effectiveDenominator) * 100 : 0;
+  const actualOptionsPct = effectiveDenominator > 0 ? (sleeveStats.options.notional / effectiveDenominator) * 100 : 0;
+  const actualForexPct = effectiveDenominator > 0 ? (sleeveStats.forex.notional / effectiveDenominator) * 100 : 0;
+  const actualCryptoPct = effectiveDenominator > 0 ? (sleeveStats.crypto.notional / effectiveDenominator) * 100 : 0;
+
+  const complianceRows = [
+    { name: 'Stocks', target: targetStocksPct, actual: actualStocksPct },
+    { name: 'Options', target: targetOptionsPct, actual: actualOptionsPct },
+    { name: 'Forex', target: targetForexPct, actual: actualForexPct },
+    { name: 'Crypto', target: targetCryptoPct, actual: actualCryptoPct },
+  ];
+
   const allocationPieData = [
     { name: 'Stocks', value: Math.max(0, Number(customAllocation.blowup_stocks_pct || 0)), color: '#22d3ee' },
     { name: 'Options', value: Math.max(0, Number(customAllocation.covered_calls_pct || 0)), color: '#fbbf24' },
@@ -476,8 +504,8 @@ export default function SettingsPanel() {
 
   return (
     <>
-      <div className="grid gap-5 xl:grid-cols-12 xl:items-start">
-          <div className="xl:col-span-8 space-y-5 self-start">
+        <div className="grid gap-5 xl:grid-cols-2 xl:items-start">
+          <div className="space-y-5 self-start">
             <section className="card">
               <div className="flex items-center gap-3 mb-3">
                 <Sparkles className="text-teal-300" size={20} />
@@ -539,6 +567,30 @@ export default function SettingsPanel() {
                     <div className="flex items-center justify-between"><span>Options</span><span className="text-slate-100">{sleeveStats.options.count > 0 ? `${sleeveStats.options.count} positions` : 'No positions'}</span></div>
                     <div className="flex items-center justify-between"><span>Forex</span><span className="text-slate-100">{sleeveStats.forex.count > 0 ? `${sleeveStats.forex.count} positions` : 'No positions'}</span></div>
                     <div className="flex items-center justify-between"><span>Crypto</span><span className="text-slate-100">{sleeveStats.crypto.count > 0 ? `${sleeveStats.crypto.count} positions` : 'No positions'}</span></div>
+                  </div>
+
+                  <div className="mt-4 pt-3 border-t border-slate-700/60">
+                    <p className="text-xs uppercase tracking-wide text-slate-300 mb-2">Allocation Compliance</p>
+                    <div className="space-y-1.5 text-xs">
+                      {complianceRows.map((row) => {
+                        const drift = row.actual - row.target;
+                        const within = Math.abs(drift) <= 5;
+                        return (
+                          <div key={row.name} className="flex items-center justify-between">
+                            <span>{row.name}</span>
+                            <span className="text-slate-200">
+                              target {row.target.toFixed(1)}% / actual {row.actual.toFixed(1)}%
+                              <span className={`ml-2 ${within ? 'text-emerald-300' : 'text-rose-300'}`}>
+                                ({drift >= 0 ? '+' : ''}{drift.toFixed(1)}%)
+                              </span>
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[11px] text-slate-400 mt-2">
+                      Actual percentages use current marked notional over account total value.
+                    </p>
                   </div>
                 </div>
               </div>
@@ -618,7 +670,7 @@ export default function SettingsPanel() {
             </section>
           </div>
 
-          <div className="xl:col-span-4 space-y-5 self-start">
+          <div className="space-y-5 self-start">
             <section className="card space-y-4">
               <div className="flex items-center gap-3 mb-2.5">
                 <Activity className="text-teal-300" size={20} />

@@ -2,13 +2,26 @@
 
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
-export default function PortfolioChart({ history, source = 'ibkr' }: { history: any[]; source?: string }) {
+export default function PortfolioChart({ history, source = 'ibkr', snapshotTimestamp = null }: { history: any[]; source?: string; snapshotTimestamp?: string | null }) {
   if (!history || history.length === 0) {
     return <div className="card text-center text-slate-300">No portfolio history available yet.</div>;
   }
 
   const normalizedSource = String(source || 'ibkr').toLowerCase();
-  const sourceLabel = `Broker ${normalizedSource.toUpperCase()} (positions-based)`;
+  let sourceLabel = 'Unknown source';
+  if (normalizedSource === 'live_broker') {
+    sourceLabel = 'IBKR live broker (positions-based)';
+  } else if (normalizedSource.includes('snapshot')) {
+    sourceLabel = 'Cached IBKR snapshot (fallback)';
+  } else if (normalizedSource === 'ibkr') {
+    sourceLabel = 'IBKR broker (positions-based)';
+  } else {
+    sourceLabel = `Source: ${normalizedSource.toUpperCase()}`;
+  }
+
+  const sourceTimeLabel = snapshotTimestamp
+    ? `Data time: ${new Date(snapshotTimestamp).toLocaleString()}`
+    : 'Data time: unavailable';
 
   const start = Number(history[0]?.cumulative_pnl ?? 0);
   const end = Number(history[history.length - 1]?.cumulative_pnl ?? 0);
@@ -37,6 +50,9 @@ export default function PortfolioChart({ history, source = 'ibkr' }: { history: 
             <span className="rounded-full px-3 py-1 text-xs font-semibold border text-cyan-200 border-cyan-400/50 bg-cyan-900/30">
               {sourceLabel}
             </span>
+            <span className="rounded-full px-3 py-1 text-xs font-semibold border text-slate-200 border-slate-500/50 bg-slate-800/40">
+              {sourceTimeLabel}
+            </span>
             <span className={`rounded-full px-3 py-1 text-xs font-semibold border ${isUp ? 'text-profit border-emerald-400/50 bg-emerald-900/35' : 'text-loss border-rose-400/50 bg-rose-900/35'}`}>
               {trendLabel} ({isUp ? '+' : ''}${(end - start).toFixed(2)})
             </span>
@@ -44,6 +60,9 @@ export default function PortfolioChart({ history, source = 'ibkr' }: { history: 
         </div>
         <p className="text-sm text-slate-300 mb-4">
           Last 30 trading days from broker account and position marks
+        </p>
+        <p className="text-xs text-slate-400 mb-4">
+          History begins on the first recorded open lot for each holding, so unrealized P&L only appears after you actually own the shares.
         </p>
         <ResponsiveContainer width="100%" height={300}>
           <LineChart data={history}>
@@ -70,7 +89,7 @@ export default function PortfolioChart({ history, source = 'ibkr' }: { history: 
       {/* Daily P&L Chart */}
       <div className="card">
         <h2 className="text-xl md:text-2xl font-bold mb-1">Daily P&L</h2>
-        <p className="text-sm text-slate-300 mb-4">Day-by-day strategy outcome</p>
+        <p className="text-sm text-slate-300 mb-4">Day-by-day mark-to-market outcome, not a synthetic trade log</p>
         <ResponsiveContainer width="100%" height={250}>
           <LineChart data={history}>
             <defs>

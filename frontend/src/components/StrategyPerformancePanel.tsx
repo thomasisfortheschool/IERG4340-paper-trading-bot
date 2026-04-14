@@ -5,12 +5,14 @@ import { tradeMetricsApi } from '@/lib/api';
 import { TrendingUp, TrendingDown, Activity, BarChart3, Calendar } from 'lucide-react';
 
 interface Trade {
-  id: string;
+  id?: string;
+  trade_id?: string;
   symbol: string;
   entry_price: number;
-  exit_price: number;
+  exit_price: number | null;
   quantity: number;
-  pnl: number;
+  pnl?: number;
+  net_pnl?: number;
   pnl_pct: number;
   strategy: string;
   entry_reason: string;
@@ -32,6 +34,8 @@ interface Metrics {
   largest_loss: number;
   sharpe_ratio: number;
   profit_factor: number;
+  realized_pnl?: number;
+  unrealized_pnl?: number;
 }
 
 interface DailyPnL {
@@ -39,6 +43,7 @@ interface DailyPnL {
   trades_count: number;
   pnl: number;
   pnl_pct: number;
+  includes_unrealized?: boolean;
 }
 
 const STRATEGIES = [
@@ -167,7 +172,9 @@ export default function StrategyPerformancePanel() {
             <p className={`text-2xl font-bold ${metrics.total_pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
               {money(metrics.total_pnl)}
             </p>
-            <p className="text-xs text-slate-500 mt-1">{metrics.total_trades} trades</p>
+            <p className="text-xs text-slate-500 mt-1">
+              {metrics.total_trades} trades • R {money(Number(metrics.realized_pnl || 0))} / U {money(Number(metrics.unrealized_pnl || 0))}
+            </p>
           </div>
 
           <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4">
@@ -200,9 +207,14 @@ export default function StrategyPerformancePanel() {
 
       {/* Daily P&L Chart */}
       <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <Calendar className="w-5 h-5 text-blue-400" />
-          <h3 className="font-semibold">Daily P&L</h3>
+        <div className="flex items-center justify-between gap-3 mb-4">
+          <div className="flex items-center gap-2">
+            <Calendar className="w-5 h-5 text-blue-400" />
+            <h3 className="font-semibold">Daily P&L</h3>
+          </div>
+          <span className="rounded-full border border-cyan-500/40 bg-cyan-900/25 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-cyan-200">
+            Includes unrealized marks
+          </span>
         </div>
 
         {dailyPnL.length === 0 ? (
@@ -213,7 +225,9 @@ export default function StrategyPerformancePanel() {
               <div key={day.date} className="flex items-center justify-between">
                 <div className="flex-1">
                   <p className="text-sm font-medium text-slate-300">{day.date}</p>
-                  <p className="text-xs text-slate-500">{day.trades_count} trades</p>
+                  <p className="text-xs text-slate-500">
+                    {day.trades_count} trades{day.includes_unrealized ? ' + unrealized mark' : ''}
+                  </p>
                 </div>
                 <div className="flex items-center gap-4">
                   <div className="w-32 h-6 bg-slate-700 rounded">
@@ -285,7 +299,7 @@ export default function StrategyPerformancePanel() {
             <p className="text-slate-400 text-center py-8">No trades yet</p>
           ) : (
             filteredTrades.map((trade) => (
-              <div key={trade.id} className="bg-slate-800/50 border border-slate-700 rounded p-3 text-sm">
+              <div key={trade.id || trade.trade_id || `${trade.timestamp}-${trade.symbol}`} className="bg-slate-800/50 border border-slate-700 rounded p-3 text-sm">
                 <div className="flex items-start justify-between mb-2">
                   <div>
                     <p className="font-semibold text-white">{trade.symbol}</p>
@@ -293,14 +307,14 @@ export default function StrategyPerformancePanel() {
                   </div>
                   <p
                     className={`font-semibold ${
-                      trade.pnl >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                      Number(trade.pnl ?? trade.net_pnl ?? 0) >= 0 ? 'text-emerald-300' : 'text-rose-300'
                     }`}
                   >
-                    {money(trade.pnl)} ({pct(trade.pnl_pct)})
+                    {money(Number(trade.pnl ?? trade.net_pnl ?? 0))} ({pct(Number(trade.pnl_pct || 0))})
                   </p>
                 </div>
                 <p className="text-xs text-slate-400 mb-1">
-                  Entered @ ${trade.entry_price.toFixed(4)} | Exited @ ${trade.exit_price.toFixed(4)} | {trade.quantity} shares
+                  Entered @ ${Number(trade.entry_price || 0).toFixed(4)} | Exited @ {trade.exit_price == null ? '-' : `$${Number(trade.exit_price).toFixed(4)}`} | {Number(trade.quantity || 0)} shares
                 </p>
                 <div className="flex justify-between text-xs text-slate-500">
                   <span>{trade.date}</span>
