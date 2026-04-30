@@ -13,6 +13,13 @@ import TickerResearchPanel from './TickerResearchPanel';
 
 // ...other imports
 
+const withTimeout = async <T,>(promise: Promise<T>, ms: number): Promise<T> => {
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+};
+
 export default function Dashboard() {
   // ...all hooks and state declarations
 
