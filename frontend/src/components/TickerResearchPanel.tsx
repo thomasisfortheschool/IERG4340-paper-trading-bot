@@ -214,7 +214,7 @@ export default function TickerResearchPanel() {
     }
 
     if (result.dividend_yield != null || result.payout_ratio != null) {
-      const dividendParts = [];
+      const dividendParts: string[] = [];
       if (result.dividend_yield != null) dividendParts.push(`yield ${(Number(result.dividend_yield) * 100).toFixed(2)}%`);
       if (result.payout_ratio != null) dividendParts.push(`payout ${(Number(result.payout_ratio) * 100).toFixed(1)}%`);
       insights.push(`Income profile: ${dividendParts.join(', ')}. That matters if you want cash flow rather than pure price appreciation.`);
