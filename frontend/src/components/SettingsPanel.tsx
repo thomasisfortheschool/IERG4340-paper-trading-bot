@@ -14,7 +14,7 @@ export default function SettingsPanel() {
     covered_calls_pct: 33.33,
     forex_pct: 33.34,
   });
-  const [selectedBroker, setSelectedBroker] = useState('ibkr');
+  const [selectedBroker, setSelectedBroker] = useState('demo');
   const [brokerRuntimeConfig, setBrokerRuntimeConfig] = useState<any>({});
   const [brokerCapabilities, setBrokerCapabilities] = useState<any>(null);
   const [brokerStatus, setBrokerStatus] = useState('');
@@ -87,11 +87,11 @@ export default function SettingsPanel() {
 
       if (brokerResult.status === 'fulfilled') {
         const brokerData = brokerResult.value.data || {};
-        setSelectedBroker((brokerData.current || 'ibkr') as 'ibkr' | 'alpaca');
+        setSelectedBroker((brokerData.current || 'demo') as 'demo' | 'ibkr' | 'alpaca');
         setBrokerRuntimeConfig(brokerData.active_config || {});
         setBrokerCapabilities(brokerData.capabilities || null);
         setBrokerStatus(
-          brokerData.connected ? `Connected to ${String(brokerData.current || 'ibkr').toUpperCase()}` : 'Broker disconnected'
+          brokerData.connected ? `Connected to ${String(brokerData.current || 'demo').toUpperCase()}` : 'Broker disconnected'
         );
       }
 
@@ -280,7 +280,7 @@ export default function SettingsPanel() {
       const response = await brokerApi.switch(selectedBroker, selectedBroker === 'ibkr' ? brokerRuntimeConfig : {});
       const capabilityResponse = await brokerApi.getCapabilities();
       const nextBroker = response.data?.broker || selectedBroker;
-      setSelectedBroker((nextBroker || 'ibkr') as 'ibkr' | 'alpaca');
+      setSelectedBroker((nextBroker || 'demo') as 'demo' | 'ibkr' | 'alpaca');
       setBrokerRuntimeConfig(response.data?.config || {});
       setBrokerCapabilities(capabilityResponse.data || null);
       setBrokerStatus(`Switched to ${String(nextBroker).toUpperCase()} paper trading`);
@@ -679,9 +679,10 @@ export default function SettingsPanel() {
               <div className="space-y-2">
                 <select
                   value={selectedBroker}
-                  onChange={(e) => setSelectedBroker(e.target.value as 'ibkr' | 'alpaca')}
+                  onChange={(e) => setSelectedBroker(e.target.value as 'demo' | 'ibkr' | 'alpaca')}
                   className="input-modern"
                 >
+                  <option value="demo">⚡ Live Demo (No API Keys Needed)</option>
                   <option value="ibkr">IBKR Paper Trading</option>
                   <option value="alpaca">Alpaca Paper Trading</option>
                 </select>
@@ -693,7 +694,13 @@ export default function SettingsPanel() {
                   {brokerLoading ? 'Switching...' : 'Switch Broker'}
                 </button>
                 {brokerStatus && <p className="text-sm text-slate-100">{brokerStatus}</p>}
-                <p className="text-xs text-slate-300 leading-snug">IBKR uses TWS/Gateway on your configured host/port.</p>
+                <p className="text-xs text-slate-300 leading-snug">
+                  {selectedBroker === 'demo'
+                    ? '⚡ Live Demo runs all strategies on a $100k virtual account using real market prices — no broker API required.'
+                    : selectedBroker === 'ibkr'
+                    ? 'IBKR uses TWS/Gateway on your configured host/port.'
+                    : 'Alpaca paper trading requires an API key and secret.'}
+                </p>
 
                 {brokerCapabilities && (
                   <div className="rounded-xl border border-slate-600/70 bg-slate-900/35 p-2.5 text-xs text-slate-300 space-y-1">

@@ -47,6 +47,7 @@ from config import ConfigManager, TradingMode
 from brokers.base_broker import BrokerFactory
 from brokers.ibkr_broker import IBKRBroker  # Register in BrokerFactory
 from brokers.alpaca_broker import AlpacaBroker  # Register in BrokerFactory
+from brokers.demo_broker import DemoBroker  # Register in BrokerFactory — no credentials needed
 from screeners.fundamental_screener import FundamentalScreener
 from screeners.option_screener import OptionScreener
 from bots.strategies import BlowupStockBot, CoveredCallBot, ForexBot
@@ -73,7 +74,7 @@ CORS(app)
 # Global state
 state = {
     "broker": None,
-    "broker_name": "ibkr",
+    "broker_name": "demo",
     "config_manager": None,
     "broker_init_attempted": False,
     "broker_init_in_progress": False,
@@ -926,26 +927,38 @@ def _get_daily_pnl(trades: list[dict[str, Any]] | None = None) -> list[dict[str,
         trades = _load_persisted_trade_logs()
     trades = [_normalize_trade_record(t) for t in (trades or []) if isinstance(t, dict)]
     
+    from datetime import datetime, timedelta, time as dt_time
+
+    def get_custom_trading_day(ts: str) -> str:
+        # Parse timestamp to datetime
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except Exception:
+            dt = datetime.now()
+        # If before 6am, count as previous day
+        if dt.time() < dt_time(6, 0):
+            dt = dt - timedelta(days=1)
+        return dt.strftime("%Y-%m-%d")
+
     daily: dict[str, list] = {}
     for trade in trades:
-        date = str(trade.get("date") or _parse_iso_date(trade.get("timestamp")) or "unknown")
+        ts = trade.get("timestamp") or trade.get("date")
+        date = get_custom_trading_day(ts)
         if date not in daily:
             daily[date] = []
         daily[date].append(trade)
-    
+
     result = []
     for date in sorted(daily.keys(), reverse=True):
         day_trades = daily[date]
         day_pnl = sum(float(t.get("pnl", t.get("net_pnl", 0)) or 0) for t in day_trades)
         day_pnl_pct = sum(float(t.get("pnl_pct", 0)) for t in day_trades) / len(day_trades) if day_trades else 0.0
-        
         result.append({
             "date": date,
             "trades_count": len(day_trades),
             "pnl": round(day_pnl, 2),
             "pnl_pct": round(day_pnl_pct, 2),
         })
-    
     return result
 
 
@@ -2401,10 +2414,10 @@ def run_async(coro, timeout: float | None = None):
 
 def load_broker_from_env():
     """Create and connect a broker from environment variables."""
-    broker_type = os.getenv("BROKER_TYPE", "ibkr").lower().strip()
+    broker_type = os.getenv("BROKER_TYPE", "demo").lower().strip()
 
-    if broker_type in {"", "demo", "mock"}:
-        raise ValueError("BROKER_TYPE demo/mock is no longer supported. Use 'ibkr' or 'alpaca'.")
+    if broker_type in {"", "mock"}:
+        broker_type = "demo"
 
     return build_and_connect_broker(broker_type)
 
@@ -2653,6 +2666,13 @@ def build_and_connect_broker(broker_type: str, overrides: dict = None):
                 errors.append(f"connect failed at {host}:{port} client_id={client_id}")
 
         raise RuntimeError("Failed to connect to IBKR. Tried: " + "; ".join(errors[:8]))
+
+    if broker_type == "demo":
+        broker = DemoBroker()
+        connected = run_async(broker.connect())
+        if not connected:
+            raise RuntimeError("Failed to initialise DemoBroker")
+        return broker, "demo", {"virtual_capital": broker.initial_capital, "paper_trading": True}
 
     raise ValueError(f"Unsupported BROKER_TYPE: {broker_type}")
 
@@ -2949,7 +2969,7 @@ def initialize():
             except Exception as e:
                 logger.error(f"Broker initialization failed: {e}")
                 state["broker"] = None
-                state["broker_name"] = str(os.getenv("BROKER_TYPE", "ibkr") or "ibkr").lower().strip() or "ibkr"
+                state["broker_name"] = str(os.getenv("BROKER_TYPE", "demo") or "demo").lower().strip() or "demo"
                 state["broker_runtime_config"] = {}
                 state["broker_init_error"] = str(e)
             finally:
@@ -4419,23 +4439,31 @@ def get_broker_status():
 
 def _build_broker_capabilities() -> dict[str, Any]:
     broker = state.get("broker")
-    broker_name = str(state.get("broker_name", "ibkr") or "ibkr")
+    broker_name = str(state.get("broker_name", "demo") or "demo")
     connected = bool(broker is not None)
-    paper_trading = bool(getattr(broker, "paper_trading", False)) if broker is not None else True
+    paper_trading = True  # All modes in this app are paper/virtual
 
-    supports_equities = bool(connected and hasattr(broker, "place_order"))
-    supports_forex = bool(connected and hasattr(broker, "place_forex_order"))
-    supports_crypto = bool(connected and hasattr(broker, "place_crypto_order"))
-    supports_options = bool(connected and hasattr(broker, "sell_covered_call"))
-
-    if not connected:
-        crypto_reason = "No live broker connected"
-    elif broker_name != "ibkr":
-        crypto_reason = f"{broker_name.upper()} broker adapter has no crypto order path yet"
-    elif supports_crypto:
-        crypto_reason = "IBKR crypto routing available (PAXOS), subject to account permissions"
+    # Demo broker supports equities and forex via yfinance fills; options not supported
+    if broker_name == "demo":
+        supports_equities = True
+        supports_forex = True
+        supports_crypto = True
+        supports_options = False
+        crypto_reason = "Live Demo mode supports crypto simulation via yfinance prices"
     else:
-        crypto_reason = "Connected broker does not expose crypto order API"
+        supports_equities = bool(connected and hasattr(broker, "place_order"))
+        supports_forex = bool(connected and hasattr(broker, "place_forex_order"))
+        supports_crypto = bool(connected and hasattr(broker, "place_crypto_order"))
+        supports_options = bool(connected and hasattr(broker, "sell_covered_call"))
+
+        if not connected:
+            crypto_reason = "No live broker connected"
+        elif broker_name != "ibkr":
+            crypto_reason = f"{broker_name.upper()} broker adapter has no crypto order path yet"
+        elif supports_crypto:
+            crypto_reason = "IBKR crypto routing available (PAXOS), subject to account permissions"
+        else:
+            crypto_reason = "Connected broker does not expose crypto order API"
 
     return {
         "broker": broker_name,
@@ -4472,8 +4500,9 @@ def get_broker_options():
             "connected": state["broker"] is not None,
             "active_config": state.get("broker_runtime_config", {}),
             "capabilities": _build_broker_capabilities(),
-            "available": ["ibkr", "alpaca"],
+            "available": ["demo", "ibkr", "alpaca"],
             "defaults": {
+                "demo": {},
                 "ibkr": {
                     "host": os.getenv("IB_HOST", "127.0.0.1"),
                     "port": int(os.getenv("IB_PORT", "7497")),
@@ -4499,10 +4528,13 @@ def post_switch_broker():
         if state.get("bot_running"):
             return jsonify({"error": "Stop the bot before switching brokers."}), 400
 
-        if broker_type not in {"ibkr", "alpaca"}:
-            return jsonify({"error": "broker must be one of: ibkr, alpaca"}), 400
+        if broker_type not in {"demo", "ibkr", "alpaca"}:
+            return jsonify({"error": "broker must be one of: demo, ibkr, alpaca"}), 400
 
         active, runtime_cfg = switch_broker(broker_type, config)
+        # Demo mode always runs with live execution through the virtual broker
+        if active == "demo":
+            state["bot_dry_run"] = False
         return jsonify({"status": "success", "broker": active, "connected": True, "config": runtime_cfg or {}}), 200
     except Exception as e:
         logger.error(f"Broker switch failed: {e}")

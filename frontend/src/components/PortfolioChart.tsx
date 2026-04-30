@@ -1,8 +1,25 @@
+
 'use client';
+export default PortfolioChart;
 
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
-export default function PortfolioChart({ history, source = 'ibkr', snapshotTimestamp = null }: { history: any[]; source?: string; snapshotTimestamp?: string | null }) {
+// Simple skeleton loader for charts
+function ChartSkeleton() {
+  return (
+    <div className="card animate-pulse flex flex-col items-center justify-center h-[300px] bg-slate-800/40">
+      <div className="w-3/4 h-6 bg-slate-700 rounded mb-4" />
+      <div className="w-full h-40 bg-slate-700 rounded" />
+    </div>
+  );
+}
+
+
+function PortfolioChart({ history, source, snapshotTimestamp }) {
+  // Show skeleton if history is undefined (still loading)
+  if (history === undefined) {
+    return <ChartSkeleton />;
+  }
   if (!history || history.length === 0) {
     return <div className="card text-center text-slate-300">No portfolio history available yet.</div>;
   }

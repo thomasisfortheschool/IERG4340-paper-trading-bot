@@ -21,10 +21,10 @@ logger = logging.getLogger(__name__)
 class IBKRBroker(BaseBroker):
     """Interactive Brokers integration using ib_insync."""
     
-    def __init__(self, host: str = "127.0.0.1", port: int = 7497, 
+    def __init__(self, host: str = "127.0.0.1", port: int = 4002, 
                  client_id: int = 100, paper_trading: bool = True):
         self.host = host
-        self.port = port  # 7497 = paper, 7496 = live
+        self.port = port  # 4002 = IBKR Gateway default, 7497 = TWS paper, 7496 = TWS live
         self.client_id = client_id
         self.paper_trading = paper_trading
         self.ib = IB()
