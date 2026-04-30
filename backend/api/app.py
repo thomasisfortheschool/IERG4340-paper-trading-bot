@@ -17,7 +17,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError, ThreadPoolExe
 from collections import deque, defaultdict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from datetime import datetime, timedelta
