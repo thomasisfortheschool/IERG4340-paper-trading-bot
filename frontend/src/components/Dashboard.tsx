@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import { useState, useEffect, useRef } from 'react';
 import { useTradingStore } from '@/store';
@@ -10,50 +10,62 @@ import SettingsPanel from './SettingsPanel';
 import StrategyCustomizationPanel from './StrategyCustomizationPanel';
 import RiskManagementPanel from './RiskManagementPanel';
 import TickerResearchPanel from './TickerResearchPanel';
-
-// ...other imports
-
-const withTimeout = async <T,>(promise: Promise<T>, ms: number): Promise<T> => {
-  const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
-  );
-  return Promise.race([promise, timeout]);
-};
+import TradingLogPanel from './TradingLogPanel';
+import BotLogPanel from './BotLogPanel';
+import ForexGridPanel from './ForexGridPanel';
+import CryptoDeskPanel from './CryptoDeskPanel';
+import WatchlistSandboxPanel from './WatchlistSandboxPanel';
+import MarketOverviewPanel from './MarketOverviewPanel';
+import StrategyPerformancePanel from './StrategyPerformancePanel';
+import StrategyConfigurationPanel from './StrategyConfigurationPanel';
+import OvernightSummaryPanel from './OvernightSummaryPanel';
+import BacktestPanel from './BacktestPanel';
+import { BarChart3, Bot, Bookmark, Briefcase, CandlestickChart, ClipboardList, Coins, Search, Settings2, Shield, SlidersHorizontal, Sparkles, TrendingUp, Moon, Zap } from 'lucide-react';
 
 export default function Dashboard() {
-  // ...all hooks and state declarations
+  const [tradeDeskView, setTradeDeskView] = useState<'signals' | 'strategy' | 'risk'>('signals');
+  const [operationsView, setOperationsView] = useState<'orders' | 'bot'>('orders');
+  const [strategiesView, setStrategiesView] = useState<'performance' | 'configuration'>('performance');
+  const [toolsView, setToolsView] = useState<'backtest' | 'summary'>('summary');
+  const [history, setHistory] = useState([]);
+  const [historySource, setHistorySource] = useState('unknown');
+  const [historySnapshotTimestamp, setHistorySnapshotTimestamp] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState('');
+  const { account, setAccount, setPositions, refreshToken, selectedBroker, activeTab, setActiveTab } = useTradingStore();
+  const fullFailureStreakRef = useRef(0);
+  const partialFailureStreakRef = useRef(0);
+  const accountDataSource = String(account?.data_source || '').toLowerCase();
+  const isFallbackData =
+    accountDataSource.includes('snapshot') ||
+    accountDataSource.includes('fallback') ||
+    accountDataSource.includes('degraded');
+
+  const withTimeout = async <T,>(promise: Promise<T>, ms: number): Promise<T> => {
+    return await new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('request timeout')), ms);
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+  };
 
   useEffect(() => {
     let canceled = false;
 
     const fetchData = async () => {
       try {
-        const t0 = performance.now();
         const [accountRes, historyRes, posRes] = await Promise.allSettled([
-          (async () => {
-            const t1 = performance.now();
-            const res = await withTimeout(accountApi.getSnapshot(), 15000);
-            const t2 = performance.now();
-            console.log(`[Timing] accountApi.getSnapshot: ${(t2 - t1).toFixed(1)}ms`);
-            return res;
-          })(),
-          (async () => {
-            const t1 = performance.now();
-            const res = await withTimeout(accountApi.getHistory(30), 15000);
-            const t2 = performance.now();
-            console.log(`[Timing] accountApi.getHistory: ${(t2 - t1).toFixed(1)}ms`);
-            return res;
-          })(),
-          (async () => {
-            const t1 = performance.now();
-            const res = await withTimeout(accountApi.getPositions(), 15000);
-            const t2 = performance.now();
-            console.log(`[Timing] accountApi.getPositions: ${(t2 - t1).toFixed(1)}ms`);
-            return res;
-          })(),
+          withTimeout(accountApi.getSnapshot(), 15000),
+          withTimeout(accountApi.getHistory(30), 15000),
+          withTimeout(accountApi.getPositions(), 15000),
         ]);
-        const t3 = performance.now();
-        console.log(`[Timing] Total dashboard fetch: ${(t3 - t0).toFixed(1)}ms`);
 
         if (canceled) {
           return;
@@ -119,14 +131,7 @@ export default function Dashboard() {
     };
   }, [setAccount, setPositions, refreshToken, selectedBroker]);
 
-  // Pass undefined for history while loading to trigger skeleton in PortfolioChart
-  if (loading) {
-    return (
-      <div className="app-shell py-8 text-center text-slate-300">
-        <PortfolioChart history={undefined as any} />
-      </div>
-    );
-  }
+  if (loading) return <div className="app-shell py-8 text-center text-slate-300">Loading dashboard data...</div>;
 
   return (
     <div className="app-shell py-5 md:py-6">
@@ -146,7 +151,7 @@ export default function Dashboard() {
       )}
       <div className="mb-6 rounded-2xl border border-slate-700/70 bg-slate-900/30 p-2">
         <div className="scroll-row md:flex md:flex-wrap md:gap-2">
-        {[...
+        {[
           { id: 'home', label: 'Home', icon: BarChart3 },
           { id: 'trade-desk', label: 'Trade Desk', icon: Sparkles },
           { id: 'positions', label: 'Portfolio', icon: Briefcase },
